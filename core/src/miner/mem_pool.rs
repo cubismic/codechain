@@ -445,6 +445,9 @@ impl MemPool {
 
             let client_account_seq = *first_seqs.get(&signer_public).expect("Low Level Database Error");
 
+            if item.seq() < client_account_seq {
+                continue
+            }
             let order = TransactionOrder::for_transaction(&item, client_account_seq);
             let order_with_tag = TransactionOrderWithTag::new(order, QueueTag::New);
 
