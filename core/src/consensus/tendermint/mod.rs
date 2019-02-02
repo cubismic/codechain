@@ -585,6 +585,7 @@ impl TendermintInner {
                 TendermintState::ProposeWaitImported {
                     block,
                 } => {
+                    self.backup();
                     if !block.transactions().is_empty() {
                         self.submit_proposal_block(&block);
                     } else {
@@ -635,6 +636,9 @@ impl TendermintInner {
                 // If the backuped step is `Commit`, we should start at `Precommit` to update the
                 // chain's best block safely.
                 Step::Precommit
+            } else if backup.step == Step::Propose {
+                // Temporarily avoid restoring in the Propose step
+                Step::Prevote
             } else {
                 backup.step
             };
