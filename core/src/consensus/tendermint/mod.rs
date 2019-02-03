@@ -363,10 +363,10 @@ impl TendermintInner {
     }
 
     fn move_to_step(&mut self, step: Step, is_restoring: bool) {
+        let prev_step = mem::replace(&mut self.step, step.into());
         if !is_restoring {
             self.backup();
         }
-        let prev_step = mem::replace(&mut self.step, step.into());
         self.extension().set_timer_step(step, self.view);
         let vote_step = VoteStep::new(self.height, self.view, step);
 
@@ -377,6 +377,8 @@ impl TendermintInner {
         if prev_step.to_step() != step && step != Step::Commit {
             self.votes_received = BitSet::new();
         }
+
+        let same_with_prev_step = prev_step.to_step() == step;
 
         // need to reset vote
         self.broadcast_state(&vote_step, self.proposal, self.votes_received);
@@ -413,7 +415,9 @@ impl TendermintInner {
                     Some(ref m) if !self.should_unlock(m.on.step.view) => m.on.block_hash,
                     _ => self.proposal,
                 };
-                self.generate_and_broadcast_message(block_hash, is_restoring);
+                if !same_with_prev_step || is_restoring {
+                    self.generate_and_broadcast_message(block_hash, is_restoring);
+                }
             }
             Step::Precommit => {
                 ctrace!(ENGINE, "move_to_step: Precommit.");
@@ -426,7 +430,9 @@ impl TendermintInner {
                     }
                     _ => None,
                 };
-                self.generate_and_broadcast_message(block_hash, is_restoring);
+                if !same_with_prev_step || is_restoring {
+                    self.generate_and_broadcast_message(block_hash, is_restoring);
+                }
             }
             Step::Commit => {
                 ctrace!(ENGINE, "move_to_step: Commit.");
@@ -460,6 +466,7 @@ impl TendermintInner {
                 };
                 let message_rlp = message.rlp_bytes().into_vec();
                 self.votes.vote(message.clone());
+                self.votes_received.set(signer_index);
                 cdebug!(ENGINE, "Generated {:?} as {}th validator.", message, signer_index);
                 self.handle_valid_message(&message, is_restoring);
 
