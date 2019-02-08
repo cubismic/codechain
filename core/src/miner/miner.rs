@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ckey::{public_to_address, Address, Password, PlatformAddress, Public};
-use cstate::{FindActionHandler, StateError, TopLevelState};
+use cstate::{FindActionHandler, TopLevelState};
 use ctypes::errors::HistoryError;
 use ctypes::transaction::{Action, IncompleteTransaction, Timelock};
 use ctypes::BlockNumber;
@@ -262,7 +262,7 @@ impl Miner {
                 let hash = tx.hash();
                 if client.transaction_block(&TransactionId::Hash(hash)).is_some() {
                     cdebug!(MINER, "Rejected transaction {:?}: already in the blockchain", hash);
-                    return Err(StateError::History(HistoryError::TransactionAlreadyImported).into())
+                    return Err(HistoryError::TransactionAlreadyImported.into())
                 }
                 match self
                     .engine
@@ -317,8 +317,7 @@ impl Miner {
                 Err(e) => Err(e),
                 Ok(()) => {
                     let idx = insertion_results_index;
-                    let result = insertion_results[idx].clone();
-                    let result = result.map_err(|x| x.into_state_error())?;
+                    let result = insertion_results[idx].clone().map_err(|x| x.into_core_error())?;
                     inserted.push(tx_hashes[idx]);
                     insertion_results_index += 1;
                     Ok(result)
@@ -348,20 +347,20 @@ impl Miner {
                         Timelock::BlockAge(value) => (
                             true,
                             client.transaction_block_number(&input.prev_out.tracker).ok_or_else(|| {
-                                Error::State(StateError::History(HistoryError::Timelocked {
+                                Error::History(HistoryError::Timelocked {
                                     timelock,
                                     remaining_time: u64::max_value(),
-                                }))
+                                })
                             })? + value,
                         ),
                         Timelock::Time(value) => (false, value),
                         Timelock::TimeAge(value) => (
                             false,
                             client.transaction_block_timestamp(&input.prev_out.tracker).ok_or_else(|| {
-                                Error::State(StateError::History(HistoryError::Timelocked {
+                                Error::History(HistoryError::Timelocked {
                                     timelock,
                                     remaining_time: u64::max_value(),
-                                }))
+                                })
                             })? + value,
                         ),
                     };
@@ -438,14 +437,15 @@ impl Miner {
         chain: &C,
     ) -> Result<(ClosedBlock, Option<H256>), Error> {
         let (transactions, mut open_block, original_work_hash) = {
-            let max_body_size = self.engine.params().max_body_size;
-            let transactions = self.mem_pool.read().top_transactions(max_body_size);
+            let mem_pool = self.mem_pool.read();
             let mut sealing_work = self.sealing_work.lock();
-            let last_work_hash = sealing_work.queue.peek_last_ref().map(|pb| pb.block().header().hash());
 
+            let last_work_hash = sealing_work.queue.peek_last_ref().map(|pb| pb.block().header().hash());
             ctrace!(MINER, "prepare_block: No existing work - making new block");
             let params = self.params.read().clone();
             let open_block = chain.prepare_open_block(parent_block_id, params.author, params.extra_data);
+            let max_body_size = self.engine.params().max_body_size;
+            let transactions = mem_pool.top_transactions(max_body_size, Some(open_block.header().timestamp()));
 
             (transactions, open_block, last_work_hash)
         };
@@ -467,7 +467,7 @@ impl Miner {
 
             match result {
                 // already have transaction - ignore
-                Err(Error::State(StateError::History(HistoryError::TransactionAlreadyImported))) => {}
+                Err(Error::History(HistoryError::TransactionAlreadyImported)) => {}
                 Err(e) => {
                     invalid_transactions.push(hash);
                     cdebug!(
@@ -961,7 +961,11 @@ impl MinerService for Miner {
 
     fn ready_transactions(&self) -> Vec<SignedTransaction> {
         let max_body_size = self.engine.params().max_body_size;
-        self.mem_pool.read().top_transactions(max_body_size)
+        self.mem_pool.read().top_transactions(max_body_size, None)
+    }
+
+    fn count_pending_transactions(&self) -> usize {
+        self.mem_pool.read().count_pending_transactions()
     }
 
     /// Get a list of all future transactions.

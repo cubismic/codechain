@@ -350,7 +350,7 @@ impl DatabaseClient for Client {
 impl AssetClient for Client {
     fn get_asset_scheme(&self, asset_type: H160, shard_id: ShardId, id: BlockId) -> TrieResult<Option<AssetScheme>> {
         if let Some(state) = Client::state_at(&self, id) {
-            Ok(state.asset_scheme(shard_id, &asset_type)?)
+            Ok(state.asset_scheme(shard_id, asset_type)?)
         } else {
             Ok(None)
         }
@@ -649,6 +649,10 @@ impl BlockChainClient for Client {
         self.importer.miner.ready_transactions()
     }
 
+    fn count_pending_transactions(&self) -> usize {
+        self.importer.miner.count_pending_transactions()
+    }
+
     fn is_pending_queue_empty(&self) -> bool {
         self.importer.miner.status().transactions_in_pending_queue == 0
     }
@@ -745,6 +749,11 @@ impl Shard for Client {
     fn number_of_shards(&self, state: StateOrBlock) -> Option<ShardId> {
         let state = self.state_info(state)?;
         state.number_of_shards().ok()
+    }
+
+    fn shard_id_by_hash(&self, create_shard_tx_hash: &H256, state: StateOrBlock) -> Option<u16> {
+        let state = self.state_info(state)?;
+        state.shard_id_by_hash(&create_shard_tx_hash).ok()?
     }
 
     fn shard_root(&self, shard_id: ShardId, state: StateOrBlock) -> Option<H256> {

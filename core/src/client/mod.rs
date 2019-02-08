@@ -190,6 +190,7 @@ pub trait RegularKeyOwner {
 pub trait Shard {
     fn number_of_shards(&self, state: StateOrBlock) -> Option<ShardId>;
 
+    fn shard_id_by_hash(&self, create_shard_tx_hash: &H256, state: StateOrBlock) -> Option<ShardId>;
     fn shard_root(&self, shard_id: ShardId, state: StateOrBlock) -> Option<H256>;
 }
 
@@ -228,6 +229,9 @@ pub trait BlockChainClient:
     /// List all transactions that are allowed into the next block.
     fn ready_transactions(&self) -> Vec<SignedTransaction>;
 
+    /// Get the count of all pending transactions currently in the mem_pool.
+    fn count_pending_transactions(&self) -> usize;
+
     /// Check there are transactions which are allowed into the next block.
     fn is_pending_queue_empty(&self) -> bool;
 
@@ -240,6 +244,7 @@ pub trait BlockChainClient:
 
     /// Get block status by block header hash.
     fn block_status(&self, id: &BlockId) -> BlockStatus;
+
 
     /// Get block total score.
     fn block_total_score(&self, id: &BlockId) -> Option<U256>;

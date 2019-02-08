@@ -14,15 +14,15 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-import { faucetAddress, faucetSecret } from "../helper/constants";
-import { makeRandomH256 } from "../helper/random";
-import CodeChain from "../helper/spawn";
-
 import { expect } from "chai";
+import "../helper/chai-similar";
 import { PlatformAddress } from "codechain-sdk/lib/core/classes";
 import { blake256, signEcdsa } from "codechain-sdk/lib/utils";
 import * as _ from "lodash";
 import "mocha";
+import { faucetAddress, faucetSecret } from "../helper/constants";
+import { makeRandomH256 } from "../helper/random";
+import CodeChain from "../helper/spawn";
 
 const RLP = require("rlp");
 
@@ -114,7 +114,13 @@ describe("store & remove", function() {
         const invoice = await node.sdk.rpc.chain.getInvoice(storeHash, {
             timeout: 1000
         });
-        expect(invoice).to.be.null;
+        expect(invoice).to.be.similarTo({
+            success: false,
+            error: {
+                type: "TextVerificationFail",
+                content: "Certifier and signer are different"
+            }
+        });
     });
 
     it("storing with invalid signature fails", async function() {
@@ -134,7 +140,13 @@ describe("store & remove", function() {
         const invoice = await node.sdk.rpc.chain.getInvoice(storeHash, {
             timeout: 1000
         });
-        expect(invoice).to.be.null;
+        expect(invoice).to.be.similarTo({
+            success: false,
+            error: {
+                type: "TextVerificationFail",
+                content: "Invalid Signature"
+            }
+        });
     });
 
     it("removal on nothing fails", async function() {

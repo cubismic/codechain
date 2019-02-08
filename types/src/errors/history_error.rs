@@ -21,13 +21,10 @@ use rlp::{Decodable, DecoderError, Encodable, RlpStream, UntrustedRlp};
 
 use super::TaggedRlp;
 use crate::transaction::Timelock;
-use crate::util::unexpected::Mismatch;
 
 #[derive(Debug, PartialEq, Clone, Eq, Serialize)]
 #[serde(tag = "type", content = "content")]
 pub enum Error {
-    /// Returned when transaction seq does not match state seq
-    InvalidSeq(Mismatch<u64>),
     /// Transaction was not imported to the queue because limit has been reached.
     LimitReached,
     /// Transaction is not valid anymore (state already has higher seq)
@@ -45,15 +42,19 @@ pub enum Error {
     TooCheapToReplace,
     /// Transaction is already imported to the queue
     TransactionAlreadyImported,
+    TransferExpired {
+        expiration: u64,
+        timestamp: u64,
+    },
 }
 
-const ERROR_ID_INVALID_SEQ: u8 = 1;
 const ERROR_ID_LIMIT_REACHED: u8 = 2;
 const ERROR_ID_OLD: u8 = 3;
 const ERROR_ID_ORDER_EXPIRED: u8 = 4;
 const ERROR_ID_TIMELOCKED: u8 = 5;
 const ERROR_ID_TOO_CHEAP_TO_REPLACE: u8 = 6;
 const ERROR_ID_TX_ALREADY_IMPORTED: u8 = 7;
+const ERROR_ID_TRANSFER_EXPIRED: u8 = 8;
 
 struct RlpHelper;
 impl TaggedRlp for RlpHelper {
@@ -61,13 +62,13 @@ impl TaggedRlp for RlpHelper {
 
     fn length_of(tag: u8) -> Result<usize, DecoderError> {
         Ok(match tag {
-            ERROR_ID_INVALID_SEQ => 2,
             ERROR_ID_LIMIT_REACHED => 1,
             ERROR_ID_OLD => 1,
             ERROR_ID_ORDER_EXPIRED => 3,
             ERROR_ID_TIMELOCKED => 3,
             ERROR_ID_TOO_CHEAP_TO_REPLACE => 1,
             ERROR_ID_TX_ALREADY_IMPORTED => 1,
+            ERROR_ID_TRANSFER_EXPIRED => 3,
             _ => return Err(DecoderError::Custom("Invalid HistoryError")),
         })
     }
@@ -76,7 +77,6 @@ impl TaggedRlp for RlpHelper {
 impl Encodable for Error {
     fn rlp_append(&self, s: &mut RlpStream) {
         match self {
-            Error::InvalidSeq(mismatch) => RlpHelper::new_tagged_list(s, ERROR_ID_INVALID_SEQ).append(mismatch),
             Error::LimitReached => RlpHelper::new_tagged_list(s, ERROR_ID_LIMIT_REACHED),
             Error::Old => RlpHelper::new_tagged_list(s, ERROR_ID_OLD),
             Error::OrderExpired {
@@ -89,6 +89,10 @@ impl Encodable for Error {
             } => RlpHelper::new_tagged_list(s, ERROR_ID_TIMELOCKED).append(timelock).append(remaining_time),
             Error::TooCheapToReplace => RlpHelper::new_tagged_list(s, ERROR_ID_TOO_CHEAP_TO_REPLACE),
             Error::TransactionAlreadyImported => RlpHelper::new_tagged_list(s, ERROR_ID_TX_ALREADY_IMPORTED),
+            Error::TransferExpired {
+                expiration,
+                timestamp,
+            } => RlpHelper::new_tagged_list(s, ERROR_ID_TRANSFER_EXPIRED).append(expiration).append(timestamp),
         };
     }
 }
@@ -97,7 +101,6 @@ impl Decodable for Error {
     fn decode(rlp: &UntrustedRlp) -> Result<Self, DecoderError> {
         let tag = rlp.val_at::<u8>(0)?;
         let error = match tag {
-            ERROR_ID_INVALID_SEQ => Error::InvalidSeq(rlp.val_at(1)?),
             ERROR_ID_LIMIT_REACHED => Error::LimitReached,
             ERROR_ID_OLD => Error::Old,
             ERROR_ID_ORDER_EXPIRED => Error::OrderExpired {
@@ -110,6 +113,10 @@ impl Decodable for Error {
             },
             ERROR_ID_TOO_CHEAP_TO_REPLACE => Error::TooCheapToReplace,
             ERROR_ID_TX_ALREADY_IMPORTED => Error::TransactionAlreadyImported,
+            ERROR_ID_TRANSFER_EXPIRED => Error::TransferExpired {
+                expiration: rlp.val_at(1)?,
+                timestamp: rlp.val_at(2)?,
+            },
             _ => return Err(DecoderError::Custom("Invalid HistoryError")),
         };
         RlpHelper::check_size(rlp, tag)?;
@@ -120,7 +127,6 @@ impl Decodable for Error {
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter) -> FormatResult {
         match self {
-            Error::InvalidSeq(mismatch) => write!(f, "Invalid transaction seq {}", mismatch),
             Error::LimitReached => write!(f, "Transaction limit reached"),
             Error::Old => write!(f, "No longer valid"),
             Error::OrderExpired {
@@ -137,6 +143,14 @@ impl Display for Error {
             ),
             Error::TooCheapToReplace => write!(f, "Fee too low to replace"),
             Error::TransactionAlreadyImported => write!(f, "The transaction is already imported"),
+            Error::TransferExpired {
+                expiration,
+                timestamp,
+            } => write!(
+                f,
+                "The TransferAsset transaction is expired. Expiration: {}, Block timestamp: {}",
+                expiration, timestamp
+            ),
         }
     }
 }

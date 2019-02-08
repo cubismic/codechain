@@ -14,24 +14,22 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-import * as _ from "lodash";
+import * as chai from "chai";
+import { $anything } from "../helper/chai-similar";
+import * as chaiAsPromised from "chai-as-promised";
+chai.use(chaiAsPromised);
+const expect = chai.expect;
 import {
     Asset,
     AssetTransferAddress,
-    U64,
-    H160
+    H160,
+    U64
 } from "codechain-sdk/lib/core/classes";
-
-import CodeChain from "../helper/spawn";
-import { ERROR } from "../helper/error";
-import { faucetAddress, faucetSecret } from "../helper/constants";
-
+import * as _ from "lodash";
 import "mocha";
-import * as chai from "chai";
-import * as chaiAsPromised from "chai-as-promised";
-
-chai.use(chaiAsPromised);
-const expect = chai.expect;
+import { faucetAddress, faucetSecret } from "../helper/constants";
+import { ERROR } from "../helper/error";
+import CodeChain from "../helper/spawn";
 
 describe("orders", function() {
     const BASE = 750;
@@ -75,8 +73,8 @@ describe("orders", function() {
                 expect(splitInvoices![0].success).to.be.true;
 
                 const splitGolds = splitTx.getTransferredAssets();
-                const splitGoldInputs = splitGolds.map((gold: Asset) =>
-                    gold.createTransferInput()
+                const splitGoldInputs = splitGolds.map((g: Asset) =>
+                    g.createTransferInput()
                 );
 
                 const expiration = Math.round(Date.now() / 1000) + 120;
@@ -233,8 +231,8 @@ describe("orders", function() {
                 expect(splitInvoices![0].success).to.be.true;
 
                 const splitGolds = splitTx.getTransferredAssets();
-                const splitGoldInputs = splitGolds.map(gold =>
-                    gold.createTransferInput()
+                const splitGoldInputs = splitGolds.map(g =>
+                    g.createTransferInput()
                 );
                 const silverInput = silver.createTransferInput();
 
@@ -1178,8 +1176,8 @@ describe("orders", function() {
                 expect(splitInvoices![0].success).to.be.true;
 
                 const splitGolds = splitTx.getTransferredAssets();
-                const splitGoldInputs = splitGolds.map(gold =>
-                    gold.createTransferInput()
+                const splitGoldInputs = splitGolds.map(g =>
+                    g.createTransferInput()
                 );
                 const silverInput = silver.createTransferInput();
 
@@ -1241,7 +1239,14 @@ describe("orders", function() {
                 );
 
                 const invoices = await node.sendAssetTransaction(transferTx);
-                expect(invoices!.length).to.equal(0);
+                expect(invoices!.length).to.equal(1);
+                expect(invoices![0]).to.be.similarTo({
+                    success: false,
+                    error: {
+                        type: "InvalidOriginOutputs",
+                        content: $anything
+                    }
+                });
             }).timeout(10_000);
 
             it("Wrong order - originOutputs are wrong (many outputs)", async function() {
@@ -1264,8 +1269,8 @@ describe("orders", function() {
                 expect(splitInvoices![0].success).to.be.true;
 
                 const splitGolds = splitTx.getTransferredAssets();
-                const splitGoldInputs = splitGolds.map(gold =>
-                    gold.createTransferInput()
+                const splitGoldInputs = splitGolds.map(g =>
+                    g.createTransferInput()
                 );
                 const silverInput = silver.createTransferInput();
 
@@ -1325,7 +1330,14 @@ describe("orders", function() {
                 );
 
                 const invoices = await node.sendAssetTransaction(transferTx);
-                expect(invoices!.length).to.equal(0);
+                expect(invoices!.length).to.equal(1);
+                expect(invoices![0]).to.be.similarTo({
+                    success: false,
+                    error: {
+                        type: "InvalidOriginOutputs",
+                        content: $anything
+                    }
+                });
             }).timeout(10_000);
 
             it("Wrong order - Ratio is wrong (from is zero)", async function() {

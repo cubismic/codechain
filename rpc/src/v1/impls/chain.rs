@@ -213,6 +213,11 @@ where
         Ok(self.client.number_of_shards(block_id.into()))
     }
 
+    fn get_shard_id_by_hash(&self, create_shard_tx_hash: H256, block_number: Option<u64>) -> Result<Option<ShardId>> {
+        let block_id = block_number.map(BlockId::Number).unwrap_or(BlockId::Latest);
+        Ok(self.client.shard_id_by_hash(&create_shard_tx_hash, block_id.into()))
+    }
+
     fn get_shard_root(&self, shard_id: ShardId, block_number: Option<u64>) -> Result<Option<H256>> {
         let block_id = block_number.map(BlockId::Number).unwrap_or(BlockId::Latest);
         Ok(self.client.shard_root(shard_id, block_id.into()))
@@ -253,7 +258,7 @@ where
     }
 
     fn get_pending_transactions_count(&self) -> Result<usize> {
-        Ok(self.client.ready_transactions().len())
+        Ok(self.client.count_pending_transactions())
     }
 
     fn get_mining_reward(&self, block_number: u64) -> Result<Option<u64>> {

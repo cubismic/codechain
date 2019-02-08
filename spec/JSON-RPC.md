@@ -72,7 +72,7 @@ A string that starts with "(NetworkID)c", and Bech32 string follows. For example
  - approver: `PlatformAddress` | `null`
  - approvals: `Signature[]`
 
-### TranferAsset Action
+### TransferAsset Action
 
  - networkId: `NetworkID`
  - metadata: `string`
@@ -81,6 +81,7 @@ A string that starts with "(NetworkID)c", and Bech32 string follows. For example
  - outputs: `AssetTransferOutput[]`
  - orders: `OrderOnTransfer[]`
  - approvals: `Signature[]`
+ - expiration: `Expiration time` | `null`
 
 ### ComposeAsset Action
 
@@ -1171,6 +1172,37 @@ Errors: `KVDB Error`, `Invalid Params`
   curl \
     -H 'Content-Type: application/json' \
     -d '{"jsonrpc": "2.0", "method": "chain_getNumberOfShards", "params": [null], "id": null}' \
+    localhost:8080
+```
+
+### Response Example
+```
+{
+  "jsonrpc":"2.0",
+  "result":3,
+  "id":null
+}
+```
+
+[Back to **List of methods**](#list-of-methods)
+
+## chain_getShardIdByHash
+Gets the id of shard, at the state of the given blockNumber.
+
+### Params
+ 1. the hash of CreateShard transaction: `H256`
+ 2. block number: `number` | `null`
+
+### Returns
+`null` | `number` - the id of shard
+
+Errors: `KVDB Error`, `Invalid Params`
+
+### Request Example
+```
+  curl \
+    -H 'Content-Type: application/json' \
+    -d '{"jsonrpc": "2.0", "method": "chain_getShardIdByHash", "params": ["0xfc196ede542b03b55aee9f106004e7e3d7ea6a9600692e964b4735a260356b50", null], "id": null}' \
     localhost:8080
 ```
 

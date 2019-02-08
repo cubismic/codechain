@@ -102,27 +102,6 @@ impl AssetScheme {
         allowed_hashes.is_empty() || allowed_hashes.contains(lock_script_hash)
     }
 
-    pub fn init(
-        &mut self,
-        metadata: String,
-        supply: u64,
-        approver: Option<Address>,
-        administrator: Option<Address>,
-        allowed_script_hashes: Vec<H160>,
-        pool: Vec<Asset>,
-    ) {
-        assert_eq!("", &self.metadata);
-        assert_eq!(0, self.supply);
-        assert_eq!(None, self.approver);
-        assert_eq!(None, self.administrator);
-        self.metadata = metadata;
-        self.supply = supply;
-        self.approver = approver;
-        self.administrator = administrator;
-        self.allowed_script_hashes = allowed_script_hashes;
-        self.pool = pool;
-    }
-
     pub fn pool(&self) -> &[Asset] {
         &self.pool
     }
@@ -138,6 +117,13 @@ impl AssetScheme {
         self.approver = approver;
         self.administrator = administrator;
         self.allowed_script_hashes = allowed_script_hashes;
+    }
+
+    pub fn reduce_supply(&mut self, quantity: u64) -> u64 {
+        assert!(self.supply >= quantity, "AssetScheme supply shouldn't be depleted");
+        let previous = self.supply;
+        self.supply -= quantity;
+        previous
     }
 }
 

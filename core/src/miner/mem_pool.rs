@@ -19,7 +19,6 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use ckey::{public_to_address, Public};
-use cstate::StateError;
 use ctypes::errors::{HistoryError, RuntimeError, SyntaxError};
 use ctypes::BlockNumber;
 use kvdb::{DBTransaction, KeyValueDB};
@@ -35,6 +34,7 @@ use super::mem_pool_types::{
 };
 use super::TransactionImportResult;
 use crate::transaction::SignedTransaction;
+use crate::Error as CoreError;
 
 const DEFAULT_POOLING_PERIOD: BlockNumber = 128;
 
@@ -46,11 +46,11 @@ pub enum Error {
 }
 
 impl Error {
-    pub fn into_state_error(self) -> StateError {
+    pub fn into_core_error(self) -> CoreError {
         match self {
-            Error::History(err) => StateError::History(err),
-            Error::Runtime(err) => StateError::Runtime(err),
-            Error::Syntax(err) => StateError::Syntax(err),
+            Error::History(err) => CoreError::History(err),
+            Error::Runtime(err) => CoreError::Runtime(err),
+            Error::Syntax(err) => CoreError::Syntax(err),
         }
     }
 }
@@ -390,6 +390,7 @@ impl MemPool {
     }
 
     /// Checks the current seq for all transactions' senders in the pool and removes the old transactions.
+    /// Expired transactions are removed by this function only.
     pub fn remove_old<F>(&mut self, fetch_account: &F, current_time: PoolingInstant, current_timestamp: u64)
     where
         F: Fn(&Public) -> AccountDetails, {
@@ -399,20 +400,28 @@ impl MemPool {
         let max_time = self.max_time_in_pool;
         let balance_check = max_time >> 3;
 
-        // Clear transactions occupying the pool too long
+        // Clear transactions occupying the pool too long, or expired
         let invalid = self
             .by_hash
             .iter()
-            .filter(|&(_, ref tx)| !tx.origin.is_local())
-            .map(|(hash, tx)| (hash, tx, current_time.saturating_sub(tx.insertion_time)))
-            .filter_map(|(hash, tx, time_diff)| {
+            .filter(|&(_, ref item)| !item.origin.is_local())
+            .map(|(hash, item)| (hash, item, current_time.saturating_sub(item.insertion_time)))
+            .filter_map(|(hash, item, time_diff)| {
+                // FIXME: In PoW, current_timestamp can be roll-backed.
+                // In that case, transactions which are removed in here can be recovered.
+                if let Some(expiration) = item.expiration() {
+                    if expiration < current_timestamp {
+                        return Some(*hash)
+                    }
+                }
+
                 if time_diff > max_time {
                     return Some(*hash)
                 }
 
                 if time_diff > balance_check {
-                    return match signers.get(&tx.signer_public()) {
-                        Some(details) if tx.cost() > details.balance => Some(*hash),
+                    return match signers.get(&item.signer_public()) {
+                        Some(details) if item.cost() > details.balance => Some(*hash),
                         _ => None,
                     }
                 }
@@ -863,7 +872,8 @@ impl MemPool {
     }
 
     /// Returns top transactions from the pool ordered by priority.
-    pub fn top_transactions(&self, size_limit: usize) -> Vec<SignedTransaction> {
+    // FIXME: current_timestamp should be `u64`, not `Option<u64>`.
+    pub fn top_transactions(&self, size_limit: usize, current_timestamp: Option<u64>) -> Vec<SignedTransaction> {
         let mut current_size: usize = 0;
         self.current
             .queue
@@ -873,6 +883,14 @@ impl MemPool {
                     .get(&t.hash)
                     .expect("All transactions in `current` and `future` are always included in `by_hash`")
             })
+            .filter(|t| {
+                if let Some(expiration) = t.expiration() {
+                    if let Some(timestamp) = current_timestamp {
+                        return expiration >= timestamp
+                    }
+                }
+                true
+            })
             .take_while(|t| {
                 let encoded_byte_array: Vec<u8> = rlp::encode(&t.tx).into_vec();
                 let size_in_byte = encoded_byte_array.len();
@@ -881,6 +899,11 @@ impl MemPool {
             })
             .map(|t| t.tx.clone())
             .collect()
+    }
+
+    /// Return all transactions in the memory pool.
+    pub fn count_pending_transactions(&self) -> usize {
+        self.current.queue.len() + self.future.queue.len()
     }
 
     /// Return all future transactions.
@@ -1219,6 +1242,7 @@ pub mod test {
                 orders: vec![],
                 metadata: "".into(),
                 approvals: vec![],
+                expiration: None,
             },
         };
         let timelock = TxTimelock {

@@ -65,13 +65,13 @@ impl CodeChainMachine {
     pub fn verify_transaction_basic(&self, p: &UnverifiedTransaction, _header: &Header) -> Result<(), Error> {
         let min_cost = self.min_cost(&p.action);
         if p.fee < min_cost {
-            return Err(StateError::Syntax(SyntaxError::InsufficientFee {
+            return Err(SyntaxError::InsufficientFee {
                 minimal: min_cost,
                 got: p.fee,
-            })
+            }
             .into())
         }
-        p.verify_basic(self.params()).map_err(StateError::from)?;
+        p.verify_basic(self.params())?;
 
         Ok(())
     }
@@ -97,9 +97,11 @@ impl CodeChainMachine {
         if let Action::TransferAsset {
             inputs,
             orders,
+            expiration,
             ..
         } = &tx.action
         {
+            Self::verify_transaction_expiration(&expiration, header)?;
             if verify_timelock {
                 Self::verify_transfer_timelock(inputs, header, client)?;
             }
@@ -115,6 +117,22 @@ impl CodeChainMachine {
         header.set_score(*parent.score());
     }
 
+    fn verify_transaction_expiration(expiration: &Option<u64>, header: &Header) -> Result<(), Error> {
+        if expiration.is_none() {
+            return Ok(())
+        }
+        let expiration = expiration.unwrap();
+
+        if expiration < header.timestamp() {
+            return Err(HistoryError::TransferExpired {
+                expiration,
+                timestamp: header.timestamp(),
+            }
+            .into())
+        }
+        Ok(())
+    }
+
     fn verify_transfer_timelock<C: BlockInfo + TransactionInfo>(
         inputs: &[AssetTransferInput],
         header: &Header,
@@ -124,47 +142,47 @@ impl CodeChainMachine {
             if let Some(timelock) = input.timelock {
                 match timelock {
                     Timelock::Block(value) if value > header.number() => {
-                        return Err(StateError::History(HistoryError::Timelocked {
+                        return Err(HistoryError::Timelocked {
                             timelock,
                             remaining_time: value - header.number(),
-                        })
+                        }
                         .into())
                     }
                     Timelock::BlockAge(value) => {
                         let absolute = client.transaction_block_number(&input.prev_out.tracker).ok_or_else(|| {
-                            Error::State(StateError::History(HistoryError::Timelocked {
+                            Error::History(HistoryError::Timelocked {
                                 timelock,
                                 remaining_time: u64::max_value(),
-                            }))
+                            })
                         })? + value;
                         if absolute > header.number() {
-                            return Err(StateError::History(HistoryError::Timelocked {
+                            return Err(HistoryError::Timelocked {
                                 timelock,
                                 remaining_time: absolute - header.number(),
-                            })
+                            }
                             .into())
                         }
                     }
                     Timelock::Time(value) if value > header.timestamp() => {
-                        return Err(StateError::History(HistoryError::Timelocked {
+                        return Err(HistoryError::Timelocked {
                             timelock,
                             remaining_time: value - header.timestamp(),
-                        })
+                        }
                         .into())
                     }
                     Timelock::TimeAge(value) => {
                         let absolute =
                             client.transaction_block_timestamp(&input.prev_out.tracker).ok_or_else(|| {
-                                Error::State(StateError::History(HistoryError::Timelocked {
+                                Error::History(HistoryError::Timelocked {
                                     timelock,
                                     remaining_time: u64::max_value(),
-                                }))
+                                })
                             })? + value;
                         if absolute > header.timestamp() {
-                            return Err(StateError::History(HistoryError::Timelocked {
+                            return Err(HistoryError::Timelocked {
                                 timelock,
                                 remaining_time: absolute - header.timestamp(),
-                            })
+                            }
                             .into())
                         }
                     }
@@ -178,10 +196,10 @@ impl CodeChainMachine {
     fn verify_transfer_order_expired(orders: &[OrderOnTransfer], header: &Header) -> Result<(), Error> {
         for order_tx in orders {
             if order_tx.order.expiration < header.timestamp() {
-                return Err(StateError::History(HistoryError::OrderExpired {
+                return Err(HistoryError::OrderExpired {
                     expiration: order_tx.order.expiration,
                     timestamp: header.timestamp(),
-                })
+                }
                 .into())
             }
         }

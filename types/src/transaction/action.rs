@@ -62,6 +62,7 @@ pub enum Action {
         orders: Vec<OrderOnTransfer>,
         metadata: String,
         approvals: Vec<Signature>,
+        expiration: Option<u64>,
     },
     ChangeAssetScheme {
         network_id: NetworkId,
@@ -457,8 +458,9 @@ impl Encodable for Action {
                 orders,
                 metadata,
                 approvals,
+                expiration,
             } => {
-                s.begin_list(8)
+                s.begin_list(9)
                     .append(&TRANSFER_ASSET)
                     .append(network_id)
                     .append_list(burns)
@@ -466,7 +468,8 @@ impl Encodable for Action {
                     .append_list(outputs)
                     .append_list(orders)
                     .append(metadata)
-                    .append_list(approvals);
+                    .append_list(approvals)
+                    .append(expiration);
             }
             Action::ChangeAssetScheme {
                 network_id,
@@ -480,8 +483,8 @@ impl Encodable for Action {
             } => {
                 s.begin_list(9)
                     .append(&CHANGE_ASSET_SCHEME)
-                    .append(shard_id)
                     .append(network_id)
+                    .append(shard_id)
                     .append(asset_type)
                     .append(metadata)
                     .append(approver)
@@ -640,7 +643,7 @@ impl Decodable for Action {
                 })
             }
             TRANSFER_ASSET => {
-                if rlp.item_count()? != 8 {
+                if rlp.item_count()? != 9 {
                     return Err(DecoderError::RlpIncorrectListLen)
                 }
                 Ok(Action::TransferAsset {
@@ -651,6 +654,7 @@ impl Decodable for Action {
                     orders: rlp.list_at(5)?,
                     metadata: rlp.val_at(6)?,
                     approvals: rlp.list_at(7)?,
+                    expiration: rlp.val_at(8)?,
                 })
             }
             CHANGE_ASSET_SCHEME => {
@@ -1052,6 +1056,7 @@ mod tests {
             orders,
             metadata,
             approvals: vec![Signature::random(), Signature::random()],
+            expiration: Some(10),
         });
     }
 
@@ -1093,6 +1098,20 @@ mod tests {
         rlp_encode_and_decode_test!(Action::Remove {
             hash: H256::random(),
             signature: Signature::random(),
+        });
+    }
+
+    #[test]
+    fn encode_and_decode_change_asset_scheme_action() {
+        rlp_encode_and_decode_test!(Action::ChangeAssetScheme {
+            network_id: "ab".into(),
+            shard_id: 1,
+            asset_type: H160::random(),
+            metadata: "some asset scheme metadata".to_string(),
+            approver: Some(Address::random()),
+            administrator: Some(Address::random()),
+            allowed_script_hashes: vec![H160::random(), H160::random(), H160::random()],
+            approvals: vec![],
         });
     }
 
@@ -1174,6 +1193,7 @@ mod tests {
             }],
             metadata: "".into(),
             approvals: vec![],
+            expiration: None,
         };
         assert_eq!(action.verify(NetworkId::default(), 1000, 1000, 1000), Ok(()));
     }
@@ -1294,6 +1314,7 @@ mod tests {
             }],
             metadata: "".into(),
             approvals: vec![],
+            expiration: None,
         };
 
         assert_eq!(action.verify(NetworkId::default(), 1000, 1000, 1000), Ok(()));
@@ -1381,6 +1402,7 @@ mod tests {
             }],
             metadata: "".into(),
             approvals: vec![],
+            expiration: None,
         };
         assert_eq!(
             action.verify(NetworkId::default(), 1000, 1000, 1000),
@@ -1502,6 +1524,7 @@ mod tests {
             }],
             metadata: "".into(),
             approvals: vec![],
+            expiration: None,
         };
         assert_eq!(
             action.verify(NetworkId::default(), 1000, 1000, 1000),
@@ -1590,6 +1613,7 @@ mod tests {
             }],
             metadata: "".into(),
             approvals: vec![],
+            expiration: None,
         };
         assert_eq!(
             action.verify(NetworkId::default(), 1000, 1000, 1000),
@@ -1678,6 +1702,7 @@ mod tests {
             }],
             metadata: "".into(),
             approvals: vec![],
+            expiration: None,
         };
         assert_eq!(
             action.verify(NetworkId::default(), 1000, 1000, 1000),
@@ -1797,6 +1822,7 @@ mod tests {
             ],
             metadata: "".into(),
             approvals: vec![],
+            expiration: None,
         };
         assert_eq!(action.verify(NetworkId::default(), 1000, 1000, 1000), Ok(()));
     }

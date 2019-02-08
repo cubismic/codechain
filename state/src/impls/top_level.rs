@@ -41,7 +41,7 @@ use std::collections::HashMap;
 use ccrypto::BLAKE_NULL_RLP;
 use ckey::{public_to_address, recover, verify_address, Address, NetworkId, Public, Signature};
 use cmerkle::{Result as TrieResult, TrieError, TrieFactory};
-use ctypes::errors::{HistoryError, RuntimeError, SyntaxError};
+use ctypes::errors::RuntimeError;
 use ctypes::invoice::Invoice;
 use ctypes::transaction::{Action, AssetWrapCCCOutput, ShardTransaction, Transaction};
 use ctypes::util::unexpected::Mismatch;
@@ -60,7 +60,7 @@ use crate::{
     ShardAddress, ShardLevelState, StateDB, StateError, StateResult, Text,
 };
 #[cfg(test)]
-use crate::{Asset, AssetSchemeAddress, OwnedAssetAddress};
+use crate::{Asset, OwnedAssetAddress};
 
 /// Representation of the entire state of all accounts in the system.
 ///
@@ -262,11 +262,8 @@ impl TopLevelState {
         signer_public: &Public,
         client: &C,
     ) -> StateResult<Invoice> {
-        let fee_payer = self.public_to_owner_address(signer_public)?;
-
         self.create_checkpoint(FEE_CHECKPOINT);
-
-        match self.apply_internal(tx, &fee_payer, signed_hash, signer_public, client) {
+        match self.apply_internal(tx, signed_hash, signer_public, client) {
             Ok(invoice) => {
                 self.discard_checkpoint(FEE_CHECKPOINT);
                 Ok(invoice)
@@ -295,15 +292,22 @@ impl TopLevelState {
     fn apply_internal<C: ChainTimeInfo + FindActionHandler>(
         &mut self,
         tx: &Transaction,
-        fee_payer: &Address,
         signed_hash: &H256,
         signer_public: &Public,
         client: &C,
     ) -> StateResult<Invoice> {
-        let seq = self.seq(fee_payer)?;
+        let (fee_payer, restricted_master_key) = if self.regular_account_exists_and_not_null(signer_public)? {
+            let regular_account = self.get_regular_account_mut(signer_public)?;
+            (public_to_address(&regular_account.owner_public()), false)
+        } else {
+            let address = public_to_address(signer_public);
+            let account = self.get_account_mut(&address)?;
+            (address, !tx.is_master_key_allowed() && account.regular_key().is_some())
+        };
+        let seq = self.seq(&fee_payer)?;
 
         if tx.seq != seq {
-            return Err(HistoryError::InvalidSeq(Mismatch {
+            return Err(RuntimeError::InvalidSeq(Mismatch {
                 expected: seq,
                 found: tx.seq,
             })
@@ -312,13 +316,17 @@ impl TopLevelState {
 
         let fee = tx.fee;
 
-        self.inc_seq(fee_payer)?;
-        self.sub_balance(fee_payer, fee)?;
+        self.inc_seq(&fee_payer)?;
+        self.sub_balance(&fee_payer, fee)?;
+
+        if restricted_master_key {
+            return Err(RuntimeError::CannotUseMasterKey.into())
+        }
 
         // The failed transaction also must pay the fee and increase seq.
         self.create_checkpoint(ACTION_CHECKPOINT);
         let result =
-            self.apply_action(&tx.action, tx.network_id, &tx.hash(), signed_hash, fee_payer, signer_public, client);
+            self.apply_action(&tx.action, tx.network_id, tx.hash(), signed_hash, &fee_payer, signer_public, client);
         match &result {
             Ok(_) => {
                 self.discard_checkpoint(ACTION_CHECKPOINT);
@@ -337,7 +345,7 @@ impl TopLevelState {
         &mut self,
         action: &Action,
         network_id: NetworkId,
-        tx_hash: &H256,
+        tx_hash: H256,
         signed_hash: &H256,
         fee_payer: &Address,
         signer_public: &Public,
@@ -453,13 +461,7 @@ impl TopLevelState {
                 Ok(Invoice::Success)
             }
             Action::CreateShard => {
-                // FIXME: Make shard creation cost configurable
-                #[cfg(test)]
-                let shard_creation_cost = 1;
-                #[cfg(not(test))]
-                let shard_creation_cost = ::std::u64::MAX;
-
-                self.create_shard(shard_creation_cost, fee_payer)?;
+                self.create_shard(fee_payer, *signed_hash)?;
                 Ok(Invoice::Success)
             }
             Action::SetShardOwners {
@@ -484,7 +486,7 @@ impl TopLevelState {
             } => Ok(self.apply_wrap_ccc(
                 network_id,
                 *shard_id,
-                *tx_hash,
+                tx_hash,
                 *lock_script_hash,
                 parameters.clone(),
                 *quantity,
@@ -690,7 +692,7 @@ impl TopLevelState {
     fn create_asset_scheme(
         &mut self,
         shard_id: ShardId,
-        a: &AssetSchemeAddress,
+        asset_type: H160,
         metadata: String,
         amount: u64,
         approver: Option<Address>,
@@ -702,7 +704,16 @@ impl TopLevelState {
             Some(shard_root) => {
                 let mut shard_cache = self.shard_caches.entry(shard_id).or_default();
                 let state = ShardLevelState::from_existing(shard_id, &mut self.db, shard_root, &mut shard_cache)?;
-                state.create_asset_scheme(a, metadata, amount, approver, administrator, allowed_script_hashes, pool)?;
+                state.create_asset_scheme(
+                    shard_id,
+                    asset_type,
+                    metadata,
+                    amount,
+                    approver,
+                    administrator,
+                    allowed_script_hashes,
+                    pool,
+                )?;
                 Ok(true)
             }
             None => Ok(false),
@@ -828,12 +839,10 @@ impl TopState for TopLevelState {
         Ok(())
     }
 
-    fn create_shard(&mut self, shard_creation_cost: u64, fee_payer: &Address) -> StateResult<()> {
-        self.sub_balance(fee_payer, shard_creation_cost)?;
-
+    fn create_shard(&mut self, fee_payer: &Address, tx_hash: H256) -> StateResult<()> {
         let shard_id = {
             let mut metadata = self.get_metadata_mut()?;
-            metadata.increase_number_of_shards()
+            metadata.add_shard(tx_hash)
         };
         self.create_shard_level_state(shard_id, vec![*fee_payer], vec![])?;
 
@@ -882,9 +891,9 @@ impl TopState for TopLevelState {
     fn store_text(&mut self, key: &H256, text: Text, sig: &Signature) -> StateResult<()> {
         match verify_address(text.certifier(), sig, &text.content_hash()) {
             Ok(false) => {
-                return Err(SyntaxError::TextVerificationFail("Certifier and signer are different".to_string()).into())
+                return Err(RuntimeError::TextVerificationFail("Certifier and signer are different".to_string()).into())
             }
-            Err(err) => return Err(SyntaxError::TextVerificationFail(err.to_string()).into()),
+            Err(err) => return Err(RuntimeError::TextVerificationFail(err.to_string()).into()),
             _ => {}
         }
         let mut text_entry = self.get_text_mut(key)?;
@@ -896,9 +905,9 @@ impl TopState for TopLevelState {
         let text = self.get_text(key)?.ok_or_else(|| RuntimeError::TextNotExist)?;
         match verify_address(text.certifier(), sig, key) {
             Ok(false) => {
-                return Err(SyntaxError::TextVerificationFail("Certifier and signer are different".to_string()).into())
+                return Err(RuntimeError::TextVerificationFail("Certifier and signer are different".to_string()).into())
             }
-            Err(err) => return Err(SyntaxError::TextVerificationFail(err.to_string()).into()),
+            Err(err) => return Err(RuntimeError::TextVerificationFail(err.to_string()).into()),
             _ => {}
         }
         self.top_cache.remove_text(key);
@@ -1266,7 +1275,6 @@ mod tests_tx {
 
     use super::*;
     use crate::tests::helpers::{get_temp_state, get_test_client};
-    use crate::AssetSchemeAddress;
 
     fn address() -> (Address, Public, Private) {
         let keypair = Random.generate().unwrap();
@@ -1282,7 +1290,7 @@ mod tests_tx {
 
         let tx = transaction!(seq: 2, fee: 5, pay!(address().0, 10));
         assert_eq!(
-            Err(StateError::History(HistoryError::InvalidSeq(Mismatch {
+            Ok(Invoice::Failure(RuntimeError::InvalidSeq(Mismatch {
                 expected: 0,
                 found: 2
             }))),
@@ -1374,7 +1382,7 @@ mod tests_tx {
         );
 
         check_top_level_state!(state, [
-            (account: sender => (seq: 2, balance: 4)),
+            (account: sender => (seq: 2, balance: 15 - 5 - 5)),
             (shard: 0 => owners: [sender])
         ]);
     }
@@ -1471,14 +1479,13 @@ mod tests_tx {
         let lock_script_hash = H160::from("0xb042ad154a3359d276835c903587ebafefea22af");
         let amount = 30;
         let asset_type = Blake::blake(mint_tracker);
-        let asset_scheme_address = AssetSchemeAddress::new(asset_type, shard_id);
 
         set_top_level_state!(state, [
             (shard: shard_id => owners: [sender]),
             (metadata: shards: 1),
             (account: sender => balance: 25),
             (regular_key: sender_public => regular_public),
-            (scheme: (shard_id, asset_scheme_address) => { supply: amount, metadata: metadata, approver: Some(sender) }),
+            (scheme: (shard_id, asset_type) => { supply: amount, metadata: metadata, approver: Some(sender) }),
             (asset: (shard_id, mint_tracker, 0) => { asset_type: asset_type, quantity: amount, lock_script_hash: lock_script_hash })
         ]);
 
@@ -1511,14 +1518,13 @@ mod tests_tx {
         let lock_script_hash = H160::from("0xb042ad154a3359d276835c903587ebafefea22af");
         let amount = 30;
         let asset_type = Blake::blake(mint_tracker);
-        let asset_scheme_address = AssetSchemeAddress::new(asset_type, shard_id);
 
         set_top_level_state!(state, [
             (shard: shard_id => owners: [sender]),
             (metadata: shards: 1),
             (account: sender => balance: 25),
             (regular_key: sender_public => regular_public),
-            (scheme: (shard_id, asset_scheme_address) => { supply: amount, metadata: metadata, approver: Some(sender) }),
+            (scheme: (shard_id, asset_type) => { supply: amount, metadata: metadata, approver: Some(sender) }),
             (asset: (shard_id, mint_tracker, 0) => { asset_type: asset_type, quantity: amount, lock_script_hash: lock_script_hash })
         ]);
 
@@ -1563,7 +1569,7 @@ mod tests_tx {
         assert_eq!(Ok(Invoice::Success), state.apply(&tx, &H256::random(), &regular_public, &get_test_client()));
         check_top_level_state!(state, [
             (account: sender => (seq: 0, balance: 20)),
-            (account: regular_address => (seq: 1, balance: 20 - 5 - 1)),
+            (account: regular_address => (seq: 1, balance: 20 - 5)),
             (shard: 0 => owners: [regular_address])
         ]);
     }
@@ -1571,12 +1577,13 @@ mod tests_tx {
     #[test]
     fn fail_when_someone_sends_some_ccc_to_an_address_which_used_as_a_regular_key() {
         let (sender, sender_public, _) = address();
+        let (receiver, receiver_public, _) = address();
         let (regular_address, regular_public, _) = address();
 
         let mut state = get_temp_state();
         set_top_level_state!(state, [
             (account: sender => balance: 20),
-            (regular_key: sender_public => regular_public)
+            (regular_key: receiver_public => regular_public)
         ]);
 
         let tx = transaction!(fee: 5, pay!(regular_address, 5));
@@ -1587,7 +1594,31 @@ mod tests_tx {
 
         check_top_level_state!(state, [
             (account: sender => (seq: 1, balance: 20 - 5)),
-            (account: regular_address => (seq: 0, balance: 0))
+            (account: receiver => (seq: 0, balance: 0, key: regular_public))
+        ]);
+    }
+
+    #[test]
+    fn fail_when_tried_to_use_master_key_instead_of_regular_key() {
+        let (sender, sender_public, _) = address();
+        let (_, regular_public, _) = address();
+        let (receiver_address, ..) = address();
+
+        let mut state = get_temp_state();
+        set_top_level_state!(state, [
+            (account: sender => balance: 20),
+            (regular_key: sender_public => regular_public)
+        ]);
+
+        let tx = transaction!(fee: 5, pay!(receiver_address, 5));
+        assert_eq!(
+            Ok(Invoice::Failure(RuntimeError::CannotUseMasterKey)),
+            state.apply(&tx, &H256::random(), &sender_public, &get_test_client())
+        );
+
+        check_top_level_state!(state, [
+            (account: sender => (seq: 1, balance: 20 - 5, key: regular_public)),
+            (account: receiver_address => (seq: 0, balance: 0))
         ]);
     }
 
@@ -1648,7 +1679,7 @@ mod tests_tx {
 
         check_top_level_state!(state, [
             (account: sender => (seq: 1, balance: 100 - 11)),
-            (scheme: (asset_type, shard_id) => { metadata: metadata, supply: amount, approver: approver }),
+            (scheme: (shard_id, asset_type) => { metadata: metadata, supply: amount, approver: approver }),
             (asset: (transaction_tracker, 0, shard_id) => { asset_type: asset_type, quantity: amount })
         ]);
     }
@@ -1683,7 +1714,7 @@ mod tests_tx {
 
         check_top_level_state!(state, [
             (account: sender => (seq: 1, balance: 100 - 5)),
-            (scheme: (asset_type, shard_id) => { metadata: metadata, supply: ::std::u64::MAX, approver: approver }),
+            (scheme: (shard_id, asset_type) => { metadata: metadata, supply: ::std::u64::MAX, approver: approver }),
             (asset: (transaction_tracker, 0, shard_id) => { asset_type: asset_type, quantity: ::std::u64::MAX })
         ]);
     }
@@ -1713,7 +1744,7 @@ mod tests_tx {
 
         check_top_level_state!(state, [
             (account: sender => (seq: 1, balance: 120 - 20)),
-            (scheme: (asset_type, shard_id) => { metadata: metadata.clone(), supply: 30 }),
+            (scheme: (shard_id, asset_type) => { metadata: metadata.clone(), supply: 30 }),
             (asset: (mint_tracker, 0, shard_id) => { asset_type: asset_type, quantity: 30 })
         ]);
 
@@ -1739,7 +1770,7 @@ mod tests_tx {
 
         check_top_level_state!(state, [
             (account: sender => (seq: 2, balance: 120 - 20 - 30)),
-            (scheme: (asset_type, shard_id) => { metadata: metadata.clone(), supply: 30 }),
+            (scheme: (shard_id, asset_type) => { metadata: metadata.clone(), supply: 30 }),
             (asset: (mint_tracker, 0, shard_id)),
             (asset: (transfer_tracker, 0, shard_id) => { asset_type: asset_type, quantity: 10 }),
             (asset: (transfer_tracker, 1, shard_id) => { asset_type: asset_type, quantity: 5 }),
@@ -1781,7 +1812,7 @@ mod tests_tx {
         let transaction_tracker = transaction.tracker().unwrap();
         let tx = transaction!(seq: 1, fee: 11, transaction);
         assert_eq!(
-            Ok(Invoice::Failure(RuntimeError::AssetSchemeDuplicated(transaction_tracker).into())),
+            Ok(Invoice::Failure(RuntimeError::AssetSchemeDuplicated(transaction_tracker))),
             state.apply(&tx, &H256::random(), &sender_public, &get_test_client())
         );
 
@@ -1909,6 +1940,7 @@ mod tests_tx {
     }
 
     #[test]
+    #[allow(clippy::cyclomatic_complexity)]
     fn wrap_ccc_and_transfer_and_unwrap_ccc() {
         let (sender, sender_public, _) = address();
 
@@ -2032,26 +2064,26 @@ mod tests_tx {
         let tx = transaction!(fee: 10, store!(content.clone(), sender, signature));
 
         assert_eq!(
-            Err(SyntaxError::TextVerificationFail("Invalid Signature".to_string()).into()),
+            Ok(Invoice::Failure(RuntimeError::TextVerificationFail("Invalid Signature".to_string()))),
             state.apply(&tx, &H256::random(), &sender_public, &get_test_client())
         );
 
         check_top_level_state!(state, [
-            (account: sender => (seq: 0, balance: 20)),
+            (account: sender => (seq: 1, balance: 10)),
             (text: &tx.hash())
         ]);
 
         let signature = sign(Random.generate().unwrap().private(), &content_hash).unwrap();
 
-        let tx = transaction!(seq: 0, fee: 10, store!(content.clone(), sender, signature));
+        let tx = transaction!(seq: 1, fee: 10, store!(content.clone(), sender, signature));
 
         assert_eq!(
-            Err(SyntaxError::TextVerificationFail("Certifier and signer are different".to_string()).into()),
+            Ok(Invoice::Failure(RuntimeError::TextVerificationFail("Certifier and signer are different".to_string()))),
             state.apply(&tx, &H256::random(), &sender_public, &get_test_client())
         );
 
         check_top_level_state!(state, [
-            (account: sender => (seq: 0, balance: 20)),
+            (account: sender => (seq: 2, balance: 0)),
             (text: &tx.hash())
         ]);
     }
@@ -2106,7 +2138,7 @@ mod tests_tx {
         let state = get_temp_state();
 
         let shard_id = 3;
-        check_top_level_state!(state, [(scheme: (H160::random(), shard_id))]);
+        check_top_level_state!(state, [(scheme: (shard_id, H160::random()))]);
     }
 
     #[test]
@@ -2117,13 +2149,92 @@ mod tests_tx {
             (account: sender => balance: 20)
         ]);
 
-        let tx = transaction!(fee: 5, Action::CreateShard);
-        assert_eq!(Ok(Invoice::Success), state.apply(&tx, &H256::random(), &sender_public, &get_test_client()));
+        let tx1 = transaction!(fee: 5, Action::CreateShard);
+        let tx2 = transaction!(seq: 1, fee: 5, Action::CreateShard);
+        let invalid_hash = H256::random();
+        let signed_hash1 = H256::random();
+        let signed_hash2 = H256::random();
+
+        assert_eq!(Ok(None), state.shard_id_by_hash(&invalid_hash));
+        assert_eq!(Ok(None), state.shard_id_by_hash(&signed_hash1));
+        assert_eq!(Ok(None), state.shard_id_by_hash(&signed_hash2));
+
+        assert_eq!(Ok(Invoice::Success), state.apply(&tx1, &signed_hash1, &sender_public, &get_test_client()));
+
+        assert_eq!(Ok(None), state.shard_id_by_hash(&invalid_hash));
+        assert_eq!(Ok(Some(0)), state.shard_id_by_hash(&signed_hash1));
+        assert_eq!(Ok(None), state.shard_id_by_hash(&signed_hash2));
 
         check_top_level_state!(state, [
-            (account: sender => (seq: 1, balance: 20 - 5 - 1)),
+            (account: sender => (seq: 1, balance: 20 - 5)),
             (shard: 0 => owners: [sender]),
             (shard: 1)
+        ]);
+
+        assert_eq!(Ok(Invoice::Success), state.apply(&tx2, &signed_hash2, &sender_public, &get_test_client()));
+        assert_eq!(Ok(None), state.shard_id_by_hash(&invalid_hash));
+        assert_eq!(Ok(Some(0)), state.shard_id_by_hash(&signed_hash1));
+        assert_eq!(Ok(Some(1)), state.shard_id_by_hash(&signed_hash2));
+
+        check_top_level_state!(state, [
+            (account: sender => (seq: 2, balance: 20 - 5 - 5)),
+            (shard: 0 => owners: [sender]),
+            (shard: 1 => owners: [sender]),
+            (shard: 2)
+        ]);
+    }
+
+    #[test]
+    #[allow(clippy::cyclomatic_complexity)]
+    fn apply_create_shard_when_there_are_default_shards() {
+        let mut state = get_temp_state();
+        let (sender, sender_public, _) = address();
+        let shard_owner0 = address().0;
+        let shard_owner1 = address().0;
+
+        set_top_level_state!(state, [
+            (shard: 0 => owners: [shard_owner0]),
+            (shard: 1 => owners: [shard_owner1]),
+            (metadata: shards: 2),
+            (account: sender => balance: 20)
+        ]);
+
+        let tx1 = transaction!(fee: 5, Action::CreateShard);
+        let tx2 = transaction!(seq: 1, fee: 5, Action::CreateShard);
+        let invalid_hash = H256::random();
+        let signed_hash1 = H256::random();
+        let signed_hash2 = H256::random();
+
+        assert_eq!(Ok(None), state.shard_id_by_hash(&invalid_hash));
+        assert_eq!(Ok(None), state.shard_id_by_hash(&signed_hash1));
+        assert_eq!(Ok(None), state.shard_id_by_hash(&signed_hash2));
+
+        assert_eq!(Ok(Invoice::Success), state.apply(&tx1, &signed_hash1, &sender_public, &get_test_client()));
+
+        assert_eq!(Ok(None), state.shard_id_by_hash(&invalid_hash));
+        assert_eq!(Ok(Some(2)), state.shard_id_by_hash(&signed_hash1));
+        assert_eq!(Ok(None), state.shard_id_by_hash(&signed_hash2));
+
+        check_top_level_state!(state, [
+            (account: sender => (seq: 1, balance: 20 - 5)),
+            (shard: 0 => owners: [shard_owner0]),
+            (shard: 1 => owners: [shard_owner1]),
+            (shard: 2 => owners: [sender]),
+            (shard: 3)
+        ]);
+
+        assert_eq!(Ok(Invoice::Success), state.apply(&tx2, &signed_hash2, &sender_public, &get_test_client()));
+        assert_eq!(Ok(None), state.shard_id_by_hash(&invalid_hash));
+        assert_eq!(Ok(Some(2)), state.shard_id_by_hash(&signed_hash1));
+        assert_eq!(Ok(Some(3)), state.shard_id_by_hash(&signed_hash2));
+
+        check_top_level_state!(state, [
+            (account: sender => (seq: 2, balance: 20 - 5 - 5)),
+            (shard: 0 => owners: [shard_owner0]),
+            (shard: 1 => owners: [shard_owner1]),
+            (shard: 2 => owners: [sender]),
+            (shard: 3 => owners: [sender]),
+            (shard: 4)
         ]);
     }
 
@@ -2140,7 +2251,7 @@ mod tests_tx {
 
         let invalid_shard_id = 3;
         check_top_level_state!(state, [
-            (account: sender => (seq: 1, balance: 20 - 5 - 1)),
+            (account: sender => (seq: 1, balance: 20 - 5)),
             (shard: 0 => owners: [sender]),
             (asset: (H256::random(), 0, invalid_shard_id))
         ]);
@@ -2159,7 +2270,7 @@ mod tests_tx {
 
         let invalid_shard_id = 3;
         check_top_level_state!(state, [
-            (account: sender => (seq: 1, balance: 20 - 5 - 1)),
+            (account: sender => (seq: 1, balance: 20 - 5)),
             (shard: 0 => owners: [sender]),
             (asset: (H256::random(), 0, invalid_shard_id))
         ]);
@@ -2393,7 +2504,7 @@ mod tests_tx {
 
         check_top_level_state!(state, [
             (account: sender => (seq: 1, balance: 100 - 20)),
-            (scheme: (asset_type, shard_id) => { metadata: metadata.clone(), supply: amount }),
+            (scheme: (shard_id, asset_type) => { metadata: metadata.clone(), supply: amount }),
             (asset: (mint_tracker, 0, shard_id) => { asset_type: asset_type, quantity: amount })
         ]);
     }

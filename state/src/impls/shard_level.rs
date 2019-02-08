@@ -20,11 +20,11 @@ use std::collections::HashMap;
 use ccrypto::{Blake, BLAKE_NULL_RLP};
 use ckey::Address;
 use cmerkle::{self, TrieError, TrieFactory};
-use ctypes::errors::{RuntimeError, SyntaxError, UnlockFailureReason};
+use ctypes::errors::{RuntimeError, UnlockFailureReason};
 use ctypes::invoice::Invoice;
 use ctypes::transaction::{
-    AssetMintOutput, AssetTransferInput, AssetTransferOutput, AssetWrapCCCOutput, Order, OrderOnTransfer,
-    PartialHashing, ShardTransaction,
+    AssetMintOutput, AssetOutPoint, AssetTransferInput, AssetTransferOutput, AssetWrapCCCOutput, Order,
+    OrderOnTransfer, PartialHashing, ShardTransaction,
 };
 use ctypes::util::unexpected::Mismatch;
 use ctypes::ShardId;
@@ -219,13 +219,13 @@ impl<'db> ShardLevelState<'db> {
         }
 
         let asset_type = Blake::blake(transaction_tracker);
-        let asset_scheme_address = AssetSchemeAddress::new(asset_type, self.shard_id);
-        if self.asset_scheme(&asset_scheme_address)?.is_some() {
+        if self.asset_scheme(self.shard_id, asset_type)?.is_some() {
             return Err(RuntimeError::AssetSchemeDuplicated(transaction_tracker).into())
         }
         let supply = supply.unwrap_or(::std::u64::MAX);
         let asset_scheme = self.create_asset_scheme(
-            &asset_scheme_address,
+            self.shard_id,
+            asset_type,
             metadata.to_string(),
             supply,
             *approver,
@@ -234,7 +234,7 @@ impl<'db> ShardLevelState<'db> {
             pool,
         )?;
 
-        ctrace!(TX, "{:?} is minted on {:?}", asset_scheme, asset_scheme_address);
+        ctrace!(TX, "{:?} is minted on {}:{:?}", asset_scheme, self.shard_id, asset_type);
 
         let asset_address = OwnedAssetAddress::new(transaction_tracker, 0, self.shard_id);
         let asset =
@@ -301,8 +301,22 @@ impl<'db> ShardLevelState<'db> {
             )?;
             created_asset.push((asset_address, output.quantity));
         }
+        let mut reduced_supplies = Vec::with_capacity(burns.len());
+        for burn in burns {
+            let AssetOutPoint {
+                asset_type,
+                shard_id,
+                quantity,
+                ..
+            } = burn.prev_out;
+            let mut asset_scheme = self.get_asset_scheme_mut(shard_id, asset_type)?;
+            let previous_supply = asset_scheme.reduce_supply(quantity);
+            reduced_supplies.push((asset_type, previous_supply, quantity))
+        }
+
         ctrace!(TX, "Deleted assets {:?}", deleted_asset);
         ctrace!(TX, "Created assets {:?}", created_asset);
+        ctrace!(TX, "Reduced asset supplies {:?}", reduced_supplies);
         Ok(())
     }
 
@@ -323,13 +337,13 @@ impl<'db> ShardLevelState<'db> {
                         if order.origin_outputs.contains(&input.prev_out) {
                             counter += 1;
                         } else {
-                            return Err(SyntaxError::InvalidOriginOutputs(order.hash()).into())
+                            return Err(RuntimeError::InvalidOriginOutputs(order.hash()).into())
                         }
                     }
                 }
             }
             if counter > 0 && counter != order.origin_outputs.len() {
-                return Err(SyntaxError::InvalidOriginOutputs(order.hash()).into())
+                return Err(RuntimeError::InvalidOriginOutputs(order.hash()).into())
             }
         }
         Ok(())
@@ -345,11 +359,12 @@ impl<'db> ShardLevelState<'db> {
         administrator: &Option<Address>,
         allowed_script_hashes: &[H160],
     ) -> StateResult<()> {
-        let asset_scheme_address = AssetSchemeAddress::new(*asset_type, self.shard_id);
         {
-            let asset_scheme = self
-                .asset_scheme(&asset_scheme_address)?
-                .ok_or_else(|| RuntimeError::AssetSchemeNotFound(asset_scheme_address.into()))?;
+            let asset_scheme =
+                self.asset_scheme(self.shard_id, *asset_type)?.ok_or_else(|| RuntimeError::AssetSchemeNotFound {
+                    asset_type: *asset_type,
+                    shard_id: self.shard_id,
+                })?;
 
             if !asset_scheme.is_centralized() {
                 return Err(RuntimeError::InsufficientPermission.into())
@@ -359,7 +374,7 @@ impl<'db> ShardLevelState<'db> {
                 return Err(RuntimeError::InsufficientPermission.into())
             }
         }
-        let mut asset_scheme = self.get_asset_scheme_mut(&asset_scheme_address)?;
+        let mut asset_scheme = self.get_asset_scheme_mut(self.shard_id, *asset_type)?;
         asset_scheme.change_data(
             metadata.to_string(),
             approver.clone(),
@@ -377,11 +392,13 @@ impl<'db> ShardLevelState<'db> {
         approvers: &[Address],
     ) -> StateResult<(OwnedAsset, OwnedAssetAddress)> {
         let asset_address = OwnedAssetAddress::new(input.prev_out.tracker, input.prev_out.index, self.shard_id);
-        let asset_scheme_address = AssetSchemeAddress::new(input.prev_out.asset_type, input.prev_out.shard_id);
 
-        let asset_scheme = self
-            .asset_scheme(&asset_scheme_address)?
-            .ok_or_else(|| RuntimeError::AssetSchemeNotFound(asset_scheme_address.into()))?;
+        let asset_scheme = self.asset_scheme(input.prev_out.shard_id, input.prev_out.asset_type)?.ok_or_else(|| {
+            RuntimeError::AssetSchemeNotFound {
+                shard_id: input.prev_out.shard_id,
+                asset_type: input.prev_out.asset_type,
+            }
+        })?;
 
         if let Some(approver) = asset_scheme.approver().as_ref() {
             if sender != approver && !approvers.contains(approver) {
@@ -410,8 +427,7 @@ impl<'db> ShardLevelState<'db> {
 
     fn check_output_script_hash(&self, output: &AssetTransferOutput) -> StateResult<()> {
         let asset_scheme = {
-            let asset_scheme_address = AssetSchemeAddress::new(output.asset_type, output.shard_id);
-            self.asset_scheme(&asset_scheme_address)?.expect("AssetScheme must exist when the asset exist")
+            self.asset_scheme(output.shard_id, output.asset_type)?.expect("AssetScheme must exist when the asset exist")
         };
         let lock_script_hash = output.lock_script_hash;
         if asset_scheme.is_allowed_script_hash(&lock_script_hash) {
@@ -442,8 +458,8 @@ impl<'db> ShardLevelState<'db> {
             }
         };
         let asset_scheme = {
-            let asset_scheme_address = AssetSchemeAddress::new(input.prev_out.asset_type, input.prev_out.shard_id);
-            self.asset_scheme(&asset_scheme_address)?.expect("AssetScheme must exist when the asset exist")
+            self.asset_scheme(input.prev_out.shard_id, input.prev_out.asset_type)?
+                .expect("AssetScheme must exist when the asset exist")
         };
         if asset_scheme.is_centralized() {
             let administrator = asset_scheme.administrator().as_ref().expect("Centralized asset has administrator");
@@ -488,7 +504,7 @@ impl<'db> ShardLevelState<'db> {
                 client,
             ),
             // FIXME : Deliver full decode error
-            _ => return Err(SyntaxError::InvalidScript.into()),
+            _ => return Err(RuntimeError::InvalidScript.into()),
         };
 
         match (script_result, burn) {
@@ -531,10 +547,10 @@ impl<'db> ShardLevelState<'db> {
             let (_, asset_address) = self.check_input_asset(input, sender, approvers)?;
             self.check_and_run_input_script(input, transaction, None, false, sender, approvers, client)?;
 
-            let asset_scheme_address = AssetSchemeAddress::new(input.prev_out.asset_type, input.prev_out.shard_id);
             let shard_asset_type = (input.prev_out.asset_type, input.prev_out.shard_id);
-            let asset_scheme =
-                self.asset_scheme(&asset_scheme_address)?.expect("AssetScheme must exist when the asset exist");
+            let asset_scheme = self
+                .asset_scheme(shard_asset_type.1, shard_asset_type.0)?
+                .expect("AssetScheme must exist when the asset exist");
             if asset_scheme.is_centralized() {
                 return Err(RuntimeError::CannotComposeCentralizedAsset.into())
             }
@@ -572,12 +588,17 @@ impl<'db> ShardLevelState<'db> {
         approvers: &[Address],
         client: &C,
     ) -> StateResult<()> {
-        let asset_type = input.prev_out.asset_type;
-        let shard_id = input.prev_out.shard_id;
-        let asset_scheme_address = AssetSchemeAddress::new(asset_type, shard_id);
-        let asset_scheme = self
-            .asset_scheme(&asset_scheme_address)?
-            .ok_or_else(|| RuntimeError::AssetSchemeNotFound(asset_scheme_address.into()))?;
+        let AssetOutPoint {
+            asset_type,
+            shard_id,
+            quantity,
+            ..
+        } = input.prev_out;
+        let asset_scheme =
+            self.asset_scheme(shard_id, asset_type)?.ok_or_else(|| RuntimeError::AssetSchemeNotFound {
+                shard_id,
+                asset_type,
+            })?;
         // The input asset should be composed asset
         if asset_scheme.pool().is_empty() {
             return Err(RuntimeError::InvalidDecomposedInput {
@@ -637,9 +658,12 @@ impl<'db> ShardLevelState<'db> {
         self.check_and_run_input_script(input, transaction, None, false, sender, approvers, client)?;
 
         self.kill_asset(&asset_address);
-        self.kill_asset_scheme(&asset_scheme_address);
 
-        ctrace!(TX, "Deleted assets {:?} {:?}", asset_type, input.prev_out.quantity);
+        let mut asset_scheme = self.get_asset_scheme_mut(self.shard_id, asset_type)?;
+        let previous_supply = asset_scheme.reduce_supply(quantity);
+
+        ctrace!(TX, "Deleted assets {:?} {:?}", asset_type, quantity);
+        ctrace!(TX, "Reduced asset supply {:?} {:?} {:?}", asset_type, previous_supply, quantity);
 
         // Put asset into DB
         for (index, output) in outputs.iter().enumerate() {
@@ -665,10 +689,10 @@ impl<'db> ShardLevelState<'db> {
         quantity: u64,
     ) -> StateResult<()> {
         let asset_type = H160::zero();
-        let asset_scheme_address = AssetSchemeAddress::new(asset_type, self.shard_id);
-        if self.asset_scheme(&asset_scheme_address)?.is_none() {
+        if self.asset_scheme(self.shard_id, asset_type)?.is_none() {
             let asset_scheme = self.create_asset_scheme(
-                &asset_scheme_address,
+                self.shard_id,
+                asset_type,
                 format!("{{\"name\":\"Wrapped CCC\",\"description\":\"Wrapped CCC in shard {}\"}}", self.shard_id),
                 ::std::u64::MAX,
                 None,
@@ -677,13 +701,7 @@ impl<'db> ShardLevelState<'db> {
                 Vec::new(),
             );
             // FIXME: Wrapped CCC is minted in here, but the metadata is not well-defined.
-            ctrace!(
-                TX,
-                "Wrapped CCC in shard {} ({:?}) is minted on {:?}",
-                self.shard_id,
-                asset_scheme,
-                asset_scheme_address
-            );
+            ctrace!(TX, "Wrapped CCC in shard {} ({:?}) is minted on {:?}", self.shard_id, asset_scheme, asset_type);
         }
 
         let asset_address = OwnedAssetAddress::new(*tx_hash, 0, self.shard_id);
@@ -714,13 +732,10 @@ impl<'db> ShardLevelState<'db> {
         self.cache.remove_asset(account);
     }
 
-    fn kill_asset_scheme(&mut self, account: &AssetSchemeAddress) {
-        self.cache.remove_asset_scheme(account);
-    }
-
     pub fn create_asset_scheme(
         &self,
-        a: &AssetSchemeAddress,
+        shard_id: ShardId,
+        asset_type: H160,
         metadata: String,
         supply: u64,
         approver: Option<Address>,
@@ -728,21 +743,15 @@ impl<'db> ShardLevelState<'db> {
         allowed_script_hashes: Vec<H160>,
         pool: Vec<Asset>,
     ) -> cmerkle::Result<AssetScheme> {
-        let mut asset_scheme = self.get_asset_scheme_mut(a)?;
-        asset_scheme.init(metadata, supply, approver, administrator, allowed_script_hashes, pool);
-        Ok(asset_scheme.clone())
+        self.cache.create_asset_scheme(&AssetSchemeAddress::new(asset_type, shard_id), || {
+            AssetScheme::new_with_pool(metadata, supply, approver, administrator, allowed_script_hashes, pool)
+        })
     }
 
-    fn get_asset_scheme_mut(&self, a: &AssetSchemeAddress) -> cmerkle::Result<RefMut<AssetScheme>> {
+    fn get_asset_scheme_mut(&self, shard_id: ShardId, asset_type: H160) -> cmerkle::Result<RefMut<AssetScheme>> {
         let db = self.db.borrow();
         let trie = TrieFactory::readonly(db.as_hashdb(), &self.root)?;
-        self.cache.asset_scheme_mut(a, &trie)
-    }
-
-    fn get_asset_mut(&self, a: &OwnedAssetAddress) -> cmerkle::Result<RefMut<OwnedAsset>> {
-        let db = self.db.borrow();
-        let trie = TrieFactory::readonly(db.as_hashdb(), &self.root)?;
-        self.cache.asset_mut(a, &trie)
+        self.cache.asset_scheme_mut(&AssetSchemeAddress::new(asset_type, shard_id), &trie)
     }
 
     pub fn create_asset(
@@ -754,17 +763,15 @@ impl<'db> ShardLevelState<'db> {
         quantity: u64,
         order_hash: Option<H256>,
     ) -> cmerkle::Result<OwnedAsset> {
-        let mut asset = self.get_asset_mut(a)?;
-        asset.init(asset_type, lock_script_hash, parameters, quantity, order_hash);
-        Ok(asset.clone())
+        self.cache.create_asset(a, || OwnedAsset::new(asset_type, lock_script_hash, parameters, quantity, order_hash))
     }
 }
 
 impl<'db> ShardStateView for ShardLevelState<'db> {
-    fn asset_scheme(&self, a: &AssetSchemeAddress) -> cmerkle::Result<Option<AssetScheme>> {
+    fn asset_scheme(&self, shard_id: ShardId, asset_type: H160) -> cmerkle::Result<Option<AssetScheme>> {
         let db = self.db.borrow();
         let trie = TrieFactory::readonly(db.as_hashdb(), &self.root)?;
-        self.cache.asset_scheme(a, &trie)
+        self.cache.asset_scheme(&AssetSchemeAddress::new(asset_type, shard_id), &trie)
     }
 
     fn asset(&self, a: &OwnedAssetAddress) -> cmerkle::Result<Option<OwnedAsset>> {
@@ -839,10 +846,10 @@ pub struct ReadOnlyShardLevelState<'db> {
 }
 
 impl<'db> ShardStateView for ReadOnlyShardLevelState<'db> {
-    fn asset_scheme(&self, a: &AssetSchemeAddress) -> cmerkle::Result<Option<AssetScheme>> {
+    fn asset_scheme(&self, shard_id: ShardId, asset_type: H160) -> cmerkle::Result<Option<AssetScheme>> {
         let db = self.db.borrow();
         let trie = TrieFactory::readonly(db.as_hashdb(), &self.root)?;
-        self.cache.asset_scheme(a, &trie)
+        self.cache.asset_scheme(&AssetSchemeAddress::new(asset_type, shard_id), &trie)
     }
 
     fn asset(&self, a: &OwnedAssetAddress) -> cmerkle::Result<Option<OwnedAsset>> {
@@ -892,10 +899,10 @@ mod tests {
 
         let transaction_tracker = transaction.tracker();
         let asset_type = Blake::blake(transaction_tracker);
-        assert_eq!(Ok(Invoice::Success), state.apply(&transaction.into(), &sender, &[sender], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&transaction, &sender, &[sender], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, SHARD_ID) => { metadata: metadata, supply: amount, approver: approver }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata, supply: amount, approver: approver }),
             (asset: (transaction_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: amount })
         ]);
     }
@@ -919,10 +926,10 @@ mod tests {
         let transaction_tracker = transaction.tracker();
         let asset_type = Blake::blake(transaction_tracker);
 
-        assert_eq!(Ok(Invoice::Success), state.apply(&transaction.into(), &sender, &[sender], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&transaction, &sender, &[sender], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, SHARD_ID) => { metadata: metadata, supply: ::std::u64::MAX, approver: approver }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata, supply: ::std::u64::MAX, approver: approver }),
             (asset: (transaction_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: ::std::u64::MAX })
         ]);
     }
@@ -946,18 +953,15 @@ mod tests {
 
         let transaction_tracker = transaction.tracker();
         let asset_type = Blake::blake(transaction_tracker);
-        assert_eq!(
-            Ok(Invoice::Success),
-            state.apply(&transaction.clone().into(), &sender, &[sender], &[], &get_test_client())
-        );
+        assert_eq!(Ok(Invoice::Success), state.apply(&transaction, &sender, &[sender], &[], &get_test_client()));
 
         assert_eq!(
-            Ok(Invoice::Failure(RuntimeError::AssetSchemeDuplicated(transaction_tracker).into())),
-            state.apply(&transaction.into(), &sender, &[sender], &[], &get_test_client())
+            Ok(Invoice::Failure(RuntimeError::AssetSchemeDuplicated(transaction_tracker))),
+            state.apply(&transaction, &sender, &[sender], &[], &get_test_client())
         );
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, SHARD_ID) => { metadata: metadata, supply: ::std::u64::MAX, approver: approver }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata, supply: ::std::u64::MAX, approver: approver }),
             (asset: (transaction_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: ::std::u64::MAX })
         ]);
     }
@@ -978,10 +982,10 @@ mod tests {
         let mint_tracker = mint.tracker();
         let asset_type = Blake::blake(mint_tracker);
 
-        assert_eq!(Ok(Invoice::Success), state.apply(&mint.into(), &sender, &[sender], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&mint, &sender, &[sender], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, SHARD_ID) => { metadata: metadata, supply: amount, approver: approver }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata, supply: amount, approver: approver }),
             (asset: (mint_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: amount })
         ]);
 
@@ -992,12 +996,12 @@ mod tests {
         let transfer_tracker = transfer.tracker();
 
         assert_eq!(
-            Ok(Invoice::Failure(RuntimeError::NotApproved(approver).into())),
-            state.apply(&transfer.into(), &sender, &[sender], &[], &get_test_client())
+            Ok(Invoice::Failure(RuntimeError::NotApproved(approver))),
+            state.apply(&transfer, &sender, &[sender], &[], &get_test_client())
         );
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, SHARD_ID) => { metadata: metadata, supply: amount, approver: approver }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata, supply: amount, approver: approver }),
             (asset: (mint_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: amount }),
             (asset: (transfer_tracker, 0, SHARD_ID))
         ]);
@@ -1017,10 +1021,10 @@ mod tests {
         let mint_tracker = mint.tracker();
         let asset_type = Blake::blake(mint_tracker);
 
-        assert_eq!(Ok(Invoice::Success), state.apply(&mint.into(), &sender, &[sender], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&mint, &sender, &[sender], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, SHARD_ID) => { metadata: metadata, supply: amount }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata, supply: amount }),
             (asset: (mint_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: amount })
         ]);
 
@@ -1035,10 +1039,10 @@ mod tests {
         );
         let transfer_tracker = transfer.tracker();
 
-        assert_eq!(Ok(Invoice::Success), state.apply(&transfer.into(), &sender, &[sender], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&transfer, &sender, &[sender], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, SHARD_ID) => { metadata: metadata, supply: amount }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata, supply: amount }),
             (asset: (mint_tracker, 0, SHARD_ID)),
             (asset: (transfer_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: 10, lock_script_hash: lock_script_hash }),
             (asset: (transfer_tracker, 1, SHARD_ID) => { asset_type: asset_type, quantity: 5, lock_script_hash: lock_script_hash }),
@@ -1067,11 +1071,11 @@ mod tests {
         let mint_tracker = mint.tracker();
         let asset_type = Blake::blake(mint_tracker);
 
-        assert_eq!(Ok(Invoice::Success), state.apply(&mint.into(), &sender, &[sender], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&mint, &sender, &[sender], &[], &get_test_client()));
 
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, SHARD_ID) => { metadata: metadata, supply: amount, allowed_script_hashes: allowed_script_hashes}),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata, supply: amount, allowed_script_hashes: allowed_script_hashes}),
             (asset: (mint_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: amount })
         ]);
 
@@ -1085,10 +1089,10 @@ mod tests {
         );
         let transfer_tracker = transfer.tracker();
 
-        assert_eq!(Ok(Invoice::Success), state.apply(&transfer.into(), &sender, &[sender], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&transfer, &sender, &[sender], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, SHARD_ID) => { metadata: metadata, supply: amount, allowed_script_hashes: allowed_script_hashes}),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata, supply: amount, allowed_script_hashes: allowed_script_hashes}),
             (asset: (mint_tracker, 0, SHARD_ID)),
             (asset: (transfer_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: 10, lock_script_hash: lock_script_hash }),
             (asset: (transfer_tracker, 1, SHARD_ID) => { asset_type: asset_type, quantity: 5, lock_script_hash: lock_script_hash }),
@@ -1116,10 +1120,10 @@ mod tests {
         let mint_tracker = mint.tracker();
         let asset_type = Blake::blake(mint_tracker);
 
-        assert_eq!(Ok(Invoice::Success), state.apply(&mint.into(), &sender, &[sender], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&mint, &sender, &[sender], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, SHARD_ID) => { metadata: metadata, supply: amount, allowed_script_hashes: allowed_script_hashes}),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata, supply: amount, allowed_script_hashes: allowed_script_hashes}),
             (asset: (mint_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: amount })
         ]);
 
@@ -1130,12 +1134,12 @@ mod tests {
         let transfer_tracker = transfer.tracker();
 
         assert_eq!(
-            Ok(Invoice::Failure(RuntimeError::ScriptNotAllowed(lock_script_hash).into())),
-            state.apply(&transfer.into(), &sender, &[sender], &[], &get_test_client())
+            Ok(Invoice::Failure(RuntimeError::ScriptNotAllowed(lock_script_hash))),
+            state.apply(&transfer, &sender, &[sender], &[], &get_test_client())
         );
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, SHARD_ID) => { metadata: metadata, supply: amount, allowed_script_hashes: allowed_script_hashes}),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata, supply: amount, allowed_script_hashes: allowed_script_hashes}),
             (asset: (mint_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: amount }),
             (asset: (transfer_tracker, 0, SHARD_ID))
         ]);
@@ -1155,10 +1159,10 @@ mod tests {
         let mint_tracker = mint.tracker();
         let asset_type = Blake::blake(mint_tracker);
 
-        assert_eq!(Ok(Invoice::Success), state.apply(&mint.into(), &sender, &[sender], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&mint, &sender, &[sender], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, SHARD_ID) => { metadata: metadata, supply: amount }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata, supply: amount }),
             (asset: (mint_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: amount })
         ]);
 
@@ -1168,16 +1172,17 @@ mod tests {
 
         let burn_tracker = burn.tracker();
 
-        assert_eq!(Ok(Invoice::Success), state.apply(&burn.into(), &sender, &[sender], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&burn, &sender, &[sender], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, SHARD_ID) => { metadata: metadata, supply: amount }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata, supply: 0 }),
             (asset: (mint_tracker, 0, SHARD_ID)),
             (asset: (burn_tracker, 0, SHARD_ID))
         ]);
     }
 
     #[test]
+    #[allow(clippy::cyclomatic_complexity)]
     fn mint_and_transfer_and_burn() {
         let sender = address();
         let mut state_db = RefCell::new(get_temp_state_db());
@@ -1191,32 +1196,33 @@ mod tests {
         let mint_tracker = mint.tracker();
         let asset_type = Blake::blake(mint_tracker);
 
-        assert_eq!(Ok(Invoice::Success), state.apply(&mint.into(), &sender, &[sender], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&mint, &sender, &[sender], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, SHARD_ID) => { metadata: metadata, supply: amount }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata, supply: amount }),
             (asset: (mint_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: amount })
         ]);
 
+        let burn_amount = 5;
         let lock_script_hash_burn = H160::from("ca5d3fa0a6887285ef6aa85cb12960a2b6706e00");
         let random_lock_script_hash = H160::random();
         let transfer = asset_transfer!(
             inputs: asset_transfer_inputs![(asset_out_point!(mint_tracker, 0, asset_type, 30), vec![0x30, 0x01])],
             asset_transfer_outputs![
                 (lock_script_hash, vec![vec![1]], asset_type, 10),
-                (lock_script_hash_burn, asset_type, 5),
+                (lock_script_hash_burn, asset_type, burn_amount),
                 (random_lock_script_hash, asset_type, 15),
             ]
         );
         let transfer_tracker = transfer.tracker();
 
-        assert_eq!(Ok(Invoice::Success), state.apply(&transfer.into(), &sender, &[sender], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&transfer, &sender, &[sender], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, SHARD_ID) => { metadata: metadata, supply: amount }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata, supply: amount }),
             (asset: (mint_tracker, 0, SHARD_ID)),
             (asset: (transfer_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: 10 }),
-            (asset: (transfer_tracker, 1, SHARD_ID) => { asset_type: asset_type, quantity: 5 }),
+            (asset: (transfer_tracker, 1, SHARD_ID) => { asset_type: asset_type, quantity: burn_amount }),
             (asset: (transfer_tracker, 2, SHARD_ID) => { asset_type: asset_type, quantity: 15 })
         ]);
 
@@ -1225,10 +1231,10 @@ mod tests {
         );
         let burn_tracker = burn.tracker();
 
-        assert_eq!(Ok(Invoice::Success), state.apply(&burn.into(), &sender, &[sender], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&burn, &sender, &[sender], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, SHARD_ID) => { metadata: metadata, supply: amount }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata, supply: amount - burn_amount }),
             (asset: (mint_tracker, 0, SHARD_ID)),
             (asset: (transfer_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: 10 }),
             (asset: (transfer_tracker, 1, SHARD_ID)),
@@ -1257,10 +1263,10 @@ mod tests {
         let mint_tracker = mint.tracker();
         let asset_type = Blake::blake(mint_tracker);
 
-        assert_eq!(Ok(Invoice::Success), state.apply(&mint.into(), &sender, &[sender], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&mint, &sender, &[sender], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, SHARD_ID) => { metadata: metadata, supply: amount, administrator: administrator }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata, supply: amount, administrator: administrator }),
             (asset: (mint_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: amount })
         ]);
 
@@ -1276,13 +1282,10 @@ mod tests {
         );
         let transfer_tracker = transfer.tracker();
 
-        assert_eq!(
-            Ok(Invoice::Success),
-            state.apply(&transfer.into(), &administrator, &[sender], &[], &get_test_client())
-        );
+        assert_eq!(Ok(Invoice::Success), state.apply(&transfer, &administrator, &[sender], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, SHARD_ID) => { metadata: metadata, supply: amount, administrator: administrator }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata, supply: amount, administrator: administrator }),
             (asset: (mint_tracker, 0, SHARD_ID)),
             (asset: (transfer_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: 10 }),
             (asset: (transfer_tracker, 1, SHARD_ID) => { asset_type: asset_type, quantity: 5 }),
@@ -1310,20 +1313,21 @@ mod tests {
         let mint_tracker = mint.tracker();
         let asset_type = Blake::blake(mint_tracker);
 
-        assert_eq!(Ok(Invoice::Success), state.apply(&mint.into(), &sender, &[sender], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&mint, &sender, &[sender], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, SHARD_ID) => { metadata: metadata, supply: amount, administrator: administrator }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata, supply: amount, administrator: administrator }),
             (asset: (mint_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: amount })
         ]);
 
-        let burn = asset_transfer!(burns: asset_transfer_inputs![(asset_out_point!(mint_tracker, 0, asset_type, 30))]);
+        let burn =
+            asset_transfer!(burns: asset_transfer_inputs![(asset_out_point!(mint_tracker, 0, asset_type, amount))]);
         let burn_tracker = burn.tracker();
 
-        assert_eq!(Ok(Invoice::Success), state.apply(&burn.into(), &administrator, &[sender], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&burn, &administrator, &[sender], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, SHARD_ID) => { metadata: metadata, supply: amount, administrator: administrator }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata, supply: 0, administrator: administrator }),
             (asset: (mint_tracker, 0, SHARD_ID)),
             (asset: (burn_tracker, 0, SHARD_ID))
         ]);
@@ -1343,10 +1347,10 @@ mod tests {
         let mint_tracker = mint.tracker();
         let asset_type = Blake::blake(mint_tracker);
 
-        assert_eq!(Ok(Invoice::Success), state.apply(&mint.into(), &sender, &[sender], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&mint, &sender, &[sender], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, SHARD_ID) => { metadata: metadata, supply: amount }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata, supply: amount }),
             (asset: (mint_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: amount })
         ]);
 
@@ -1359,25 +1363,23 @@ mod tests {
         let asset_address = OwnedAssetAddress::new(mint_tracker, 0, SHARD_ID).into();
 
         assert_eq!(
-            Ok(Invoice::Failure(
-                RuntimeError::InvalidAssetQuantity {
-                    address: asset_address,
-                    expected: 30,
-                    got: 20
-                }
-                .into()
-            )),
-            state.apply(&transfer.into(), &sender, &[sender], &[], &get_test_client())
+            Ok(Invoice::Failure(RuntimeError::InvalidAssetQuantity {
+                address: asset_address,
+                expected: 30,
+                got: 20
+            })),
+            state.apply(&transfer, &sender, &[sender], &[], &get_test_client())
         );
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, SHARD_ID) => { metadata: metadata, supply: amount }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata, supply: amount }),
             (asset: (mint_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: amount }),
             (asset: (transfer_tracker, 0, SHARD_ID))
         ]);
     }
 
     #[test]
+    #[allow(clippy::cyclomatic_complexity)]
     fn cannot_transfer_because_prev_out_type_is_invalid() {
         let sender = address();
         let mut state_db = RefCell::new(get_temp_state_db());
@@ -1397,19 +1399,19 @@ mod tests {
         let mint_tracker2 = mint2.tracker();
         let asset_type2 = Blake::blake(mint_tracker2);
 
-        assert_eq!(Ok(Invoice::Success), state.apply(&mint1.into(), &sender, &[sender], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&mint1, &sender, &[sender], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type1, SHARD_ID) => { metadata: metadata1, supply: amount }),
-            (scheme: (asset_type2, SHARD_ID)),
+            (scheme: (SHARD_ID, asset_type1) => { metadata: metadata1, supply: amount }),
+            (scheme: (SHARD_ID, asset_type2)),
             (asset: (mint_tracker1, 0, SHARD_ID) => { asset_type: asset_type1, quantity: amount })
         ]);
 
-        assert_eq!(Ok(Invoice::Success), state.apply(&mint2.into(), &sender, &[sender], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&mint2, &sender, &[sender], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type1, SHARD_ID) => { metadata: metadata1, supply: amount }),
-            (scheme: (asset_type2, SHARD_ID) => { metadata: metadata2, supply: amount }),
+            (scheme: (SHARD_ID, asset_type1) => { metadata: metadata1, supply: amount }),
+            (scheme: (SHARD_ID, asset_type2) => { metadata: metadata2, supply: amount }),
             (asset: (mint_tracker1, 0, SHARD_ID) => { asset_type: asset_type1, quantity: amount }),
             (asset: (mint_tracker2, 0, SHARD_ID) => { asset_type: asset_type2, quantity: amount })
         ]);
@@ -1421,13 +1423,13 @@ mod tests {
         let transfer_tracker = transfer.tracker();
 
         assert_eq!(
-            Ok(Invoice::Failure(RuntimeError::InvalidAssetType(asset_type2).into())),
-            state.apply(&transfer.into(), &sender, &[sender], &[], &get_test_client())
+            Ok(Invoice::Failure(RuntimeError::InvalidAssetType(asset_type2))),
+            state.apply(&transfer, &sender, &[sender], &[], &get_test_client())
         );
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type1, SHARD_ID) => { metadata: metadata1, supply: amount }),
-            (scheme: (asset_type2, SHARD_ID) => { metadata: metadata2, supply: amount }),
+            (scheme: (SHARD_ID, asset_type1) => { metadata: metadata1, supply: amount }),
+            (scheme: (SHARD_ID, asset_type2) => { metadata: metadata2, supply: amount }),
             (asset: (mint_tracker1, 0, SHARD_ID) => { asset_type: asset_type1, quantity: amount }),
             (asset: (mint_tracker2, 0, SHARD_ID) => { asset_type: asset_type2, quantity: amount }),
             (asset: (transfer_tracker, 0, SHARD_ID))
@@ -1445,10 +1447,10 @@ mod tests {
         let mint = asset_mint!(asset_mint_output!(lock_script_hash, supply: amount), metadata.clone());
         let mint_tracker = mint.tracker();
         let asset_type = Blake::blake(mint_tracker);
-        assert_eq!(Ok(Invoice::Success), state.apply(&mint.into(), &sender, &[sender], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&mint, &sender, &[sender], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, shard_id) => { metadata: metadata.clone(), supply: amount }),
+            (scheme: (shard_id, asset_type) => { metadata: metadata.clone(), supply: amount }),
             (asset: (mint_tracker, 0, shard_id) => { asset_type: asset_type, quantity: amount })
         ]);
 
@@ -1456,6 +1458,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cyclomatic_complexity)]
     fn mint_three_times_and_transfer_with_order() {
         let sender = address();
         let mut state_db = RefCell::new(get_temp_state_db());
@@ -1502,12 +1505,12 @@ mod tests {
         );
         let transfer_tracker = transfer.tracker();
 
-        assert_eq!(Ok(Invoice::Success), state.apply(&transfer.into(), &sender, &[sender], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&transfer, &sender, &[sender], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type_1, SHARD_ID) => { metadata: "metadata1".to_string(), supply: 30 }),
-            (scheme: (asset_type_2, SHARD_ID) => { metadata: "metadata2".to_string(), supply: 30 }),
-            (scheme: (asset_type_3, SHARD_ID) => { metadata: "metadata3".to_string(), supply: 30 }),
+            (scheme: (SHARD_ID, asset_type_1) => { metadata: "metadata1".to_string(), supply: 30 }),
+            (scheme: (SHARD_ID, asset_type_2) => { metadata: "metadata2".to_string(), supply: 30 }),
+            (scheme: (SHARD_ID, asset_type_3) => { metadata: "metadata3".to_string(), supply: 30 }),
             (asset: (mint_output_1.tracker, 0, SHARD_ID)),
             (asset: (mint_output_2.tracker, 0, SHARD_ID)),
             (asset: (mint_output_3.tracker, 0, SHARD_ID)),
@@ -1533,10 +1536,10 @@ mod tests {
         let mint = asset_mint!(asset_mint_output!(lock_script_hash, supply: amount), metadata.clone());
         let mint_tracker = mint.tracker();
         let asset_type = Blake::blake(mint_tracker);
-        assert_eq!(Ok(Invoice::Success), state.apply(&mint.into(), &sender, &[], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&mint, &sender, &[], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, SHARD_ID) => { metadata: metadata.clone(), supply: amount }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata.clone(), supply: amount }),
             (asset: (mint_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: amount })
         ]);
 
@@ -1549,12 +1552,12 @@ mod tests {
         let compose_tracker = compose.tracker();
         let composed_asset_type = Blake::blake(compose_tracker);
 
-        assert_eq!(Ok(Invoice::Success), state.apply(&compose.into(), &sender, &[], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&compose, &sender, &[], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, SHARD_ID) => { metadata: metadata.clone(), supply: amount }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata.clone(), supply: amount }),
             (asset: (mint_tracker, 0, SHARD_ID)),
-            (scheme: (composed_asset_type, SHARD_ID) => { metadata: "composed".to_string(), supply: 1, pool: [Asset::new(asset_type, amount)] }),
+            (scheme: (SHARD_ID, composed_asset_type) => { metadata: "composed".to_string(), supply: 1, pool: [Asset::new(asset_type, amount)] }),
             (asset: (compose_tracker, 0, SHARD_ID) => { asset_type: composed_asset_type, quantity: 1 })
         ]);
     }
@@ -1572,10 +1575,10 @@ mod tests {
         let mint = asset_mint!(asset_mint_output!(lock_script_hash, supply: amount), metadata.clone());
         let mint_tracker = mint.tracker();
         let asset_type = Blake::blake(mint_tracker);
-        assert_eq!(Ok(Invoice::Success), state.apply(&mint.into(), &sender, &[], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&mint, &sender, &[], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, SHARD_ID) => { metadata: metadata.clone(), supply: amount }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata.clone(), supply: amount }),
             (asset: (mint_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: amount })
         ]);
 
@@ -1587,12 +1590,12 @@ mod tests {
         let compose_tracker = compose.tracker();
         let composed_asset_type = Blake::blake(compose_tracker);
 
-        assert_eq!(Ok(Invoice::Success), state.apply(&compose.into(), &sender, &[], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&compose, &sender, &[], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, SHARD_ID) => { metadata: metadata.clone(), supply: amount }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata.clone(), supply: amount }),
             (asset: (mint_tracker, 0, SHARD_ID)),
-            (scheme: (composed_asset_type, SHARD_ID) => { metadata: "composed".to_string(), supply: 1, pool: [Asset::new(asset_type, amount)] }),
+            (scheme: (SHARD_ID, composed_asset_type) => { metadata: "composed".to_string(), supply: 1, pool: [Asset::new(asset_type, amount)] }),
             (asset: (compose_tracker, 0, SHARD_ID) => { asset_type: composed_asset_type, quantity: 1 })
         ]);
 
@@ -1603,18 +1606,19 @@ mod tests {
         );
         let decompose_tracker = decompose.tracker();
 
-        assert_eq!(Ok(Invoice::Success), state.apply(&decompose.into(), &sender, &[], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&decompose, &sender, &[], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, SHARD_ID) => { metadata: metadata.clone(), supply: amount }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata.clone(), supply: amount }),
             (asset: (mint_tracker, 0, SHARD_ID)),
-            (scheme: (composed_asset_type, SHARD_ID)),
+            (scheme: (SHARD_ID, composed_asset_type)  => { metadata: "composed".to_string(), supply: 0, pool: [Asset::new(asset_type, amount)] }),
             (asset: (compose_tracker, 0, SHARD_ID)),
             (asset: (decompose_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: amount })
         ]);
     }
 
     #[test]
+    #[allow(clippy::cyclomatic_complexity)]
     fn decompose_fail_invalid_input_different_asset_type() {
         let mut state_db = RefCell::new(get_temp_state_db());
         let mut shard_cache = ShardCache::default();
@@ -1628,10 +1632,10 @@ mod tests {
         let mint_tracker = mint.tracker();
         let asset_type = Blake::blake(mint_tracker);
 
-        assert_eq!(Ok(Invoice::Success), state.apply(&mint.into(), &sender, &[], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&mint, &sender, &[], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, SHARD_ID) => { metadata: metadata.clone(), supply: amount }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata.clone(), supply: amount }),
             (asset: (mint_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: amount })
         ]);
 
@@ -1639,12 +1643,12 @@ mod tests {
         let mint2_tracker = mint2.tracker();
         let asset_type2 = Blake::blake(mint2_tracker);
 
-        assert_eq!(Ok(Invoice::Success), state.apply(&mint2.into(), &sender, &[], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&mint2, &sender, &[], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, SHARD_ID) => { metadata: metadata.clone(), supply: amount }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata.clone(), supply: amount }),
             (asset: (mint_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: amount }),
-            (scheme: (asset_type2, SHARD_ID) => { metadata: "invalid_asset".to_string(), supply: amount }),
+            (scheme: (SHARD_ID, asset_type2) => { metadata: "invalid_asset".to_string(), supply: amount }),
             (asset: (mint2_tracker, 0, SHARD_ID) => { asset_type: asset_type2, quantity: amount })
         ]);
 
@@ -1656,14 +1660,14 @@ mod tests {
         let compose_tracker = compose.tracker();
         let composed_asset_type = Blake::blake(compose_tracker);
 
-        assert_eq!(Ok(Invoice::Success), state.apply(&compose.into(), &sender, &[], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&compose, &sender, &[], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, SHARD_ID) => { metadata: metadata.clone(), supply: amount }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata.clone(), supply: amount }),
             (asset: (mint_tracker, 0, SHARD_ID)),
-            (scheme: (asset_type2, SHARD_ID) => { metadata: "invalid_asset".to_string(), supply: amount }),
+            (scheme: (SHARD_ID, asset_type2) => { metadata: "invalid_asset".to_string(), supply: amount }),
             (asset: (mint2_tracker, 0, SHARD_ID) => { asset_type: asset_type2, quantity: amount }),
-            (scheme: (composed_asset_type, SHARD_ID) => { metadata: "composed".to_string(), supply: 1, pool: [Asset::new(asset_type, amount)] }),
+            (scheme: (SHARD_ID, composed_asset_type) => { metadata: "composed".to_string(), supply: 1, pool: [Asset::new(asset_type, amount)] }),
             (asset: (compose_tracker, 0, SHARD_ID) => { asset_type: composed_asset_type, quantity: 1 })
         ]);
 
@@ -1674,28 +1678,26 @@ mod tests {
         );
 
         assert_eq!(
-            Ok(Invoice::Failure(
-                RuntimeError::InvalidDecomposedInput {
-                    asset_type: asset_type2,
-                    shard_id: SHARD_ID,
-                    got: 0,
-                }
-                .into()
-            )),
-            state.apply(&decompose.into(), &sender, &[], &[], &get_test_client())
+            Ok(Invoice::Failure(RuntimeError::InvalidDecomposedInput {
+                asset_type: asset_type2,
+                shard_id: SHARD_ID,
+                got: 0,
+            })),
+            state.apply(&decompose, &sender, &[], &[], &get_test_client())
         );
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, SHARD_ID) => { metadata: metadata.clone(), supply: amount }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata.clone(), supply: amount }),
             (asset: (mint_tracker, 0, SHARD_ID) ),
-            (scheme: (asset_type2, SHARD_ID) => { metadata: "invalid_asset".to_string(), supply: amount }),
+            (scheme: (SHARD_ID, asset_type2) => { metadata: "invalid_asset".to_string(), supply: amount }),
             (asset: (mint2_tracker, 0, SHARD_ID) => { asset_type: asset_type2, quantity: amount }),
-            (scheme: (composed_asset_type, SHARD_ID) => { metadata: "composed".to_string(), supply: 1, pool: [Asset::new(asset_type, amount)] }),
+            (scheme: (SHARD_ID, composed_asset_type) => { metadata: "composed".to_string(), supply: 1, pool: [Asset::new(asset_type, amount)] }),
             (asset: (compose_tracker, 0, SHARD_ID) => { asset_type: composed_asset_type, quantity: 1 })
         ]);
     }
 
     #[test]
+    #[allow(clippy::cyclomatic_complexity)]
     fn decompose_fail_invalid_output_insufficient_output() {
         let mut state_db = RefCell::new(get_temp_state_db());
         let mut shard_cache = ShardCache::default();
@@ -1709,10 +1711,10 @@ mod tests {
         let mint_tracker = mint.tracker();
         let asset_type = Blake::blake(mint_tracker);
 
-        assert_eq!(Ok(Invoice::Success), state.apply(&mint.into(), &sender, &[], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&mint, &sender, &[], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, SHARD_ID) => { metadata: metadata.clone(), supply: amount }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata.clone(), supply: amount }),
             (asset: (mint_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: amount })
         ]);
 
@@ -1720,12 +1722,12 @@ mod tests {
         let mint2_tracker = mint2.tracker();
         let asset_type2 = Blake::blake(mint2_tracker);
 
-        assert_eq!(Ok(Invoice::Success), state.apply(&mint2.into(), &sender, &[], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&mint2, &sender, &[], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, SHARD_ID) => { metadata: metadata.clone(), supply: amount }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata.clone(), supply: amount }),
             (asset: (mint_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: amount }),
-            (scheme: (asset_type2, SHARD_ID) => { metadata: "invalid_asset".to_string(), supply: 1 }),
+            (scheme: (SHARD_ID, asset_type2) => { metadata: "invalid_asset".to_string(), supply: 1 }),
             (asset: (mint2_tracker, 0, SHARD_ID) => { asset_type: asset_type2, quantity: 1 })
         ]);
 
@@ -1740,14 +1742,14 @@ mod tests {
         let compose_tracker = compose.tracker();
         let composed_asset_type = Blake::blake(compose_tracker);
 
-        assert_eq!(Ok(Invoice::Success), state.apply(&compose.into(), &sender, &[], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&compose, &sender, &[], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, SHARD_ID) => { metadata: metadata.clone(), supply: amount }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata.clone(), supply: amount }),
             (asset: (mint_tracker, 0, SHARD_ID)),
-            (scheme: (asset_type2, SHARD_ID) => { metadata: "invalid_asset".to_string(), supply: 1 }),
+            (scheme: (SHARD_ID, asset_type2) => { metadata: "invalid_asset".to_string(), supply: 1 }),
             (asset: (mint2_tracker, 0, SHARD_ID)),
-            (scheme: (composed_asset_type, SHARD_ID) => { metadata: "composed".to_string(), supply: 1 }),
+            (scheme: (SHARD_ID, composed_asset_type) => { metadata: "composed".to_string(), supply: 1 }),
             (asset: (compose_tracker, 0, SHARD_ID) => { asset_type: composed_asset_type, quantity: 1 })
         ]);
 
@@ -1758,30 +1760,28 @@ mod tests {
         );
 
         assert_eq!(
-            Ok(Invoice::Failure(
-                RuntimeError::InvalidDecomposedOutput {
-                    asset_type: asset_type2,
-                    shard_id: SHARD_ID,
-                    expected: 1,
-                    got: 0,
-                }
-                .into()
-            )),
-            state.apply(&decompose.into(), &sender, &[], &[], &get_test_client())
+            Ok(Invoice::Failure(RuntimeError::InvalidDecomposedOutput {
+                asset_type: asset_type2,
+                shard_id: SHARD_ID,
+                expected: 1,
+                got: 0,
+            })),
+            state.apply(&decompose, &sender, &[], &[], &get_test_client())
         );
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, SHARD_ID) => { metadata: metadata.clone(), supply: amount }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata.clone(), supply: amount }),
             (asset: (mint_tracker, 0, SHARD_ID)),
-            (scheme: (asset_type2, SHARD_ID) => { metadata: "invalid_asset".to_string(), supply: 1 }),
+            (scheme: (SHARD_ID, asset_type2) => { metadata: "invalid_asset".to_string(), supply: 1 }),
             (asset: (mint2_tracker, 0, SHARD_ID)),
-            (scheme: (composed_asset_type, SHARD_ID) => { metadata: "composed".to_string(), supply: 1 }),
+            (scheme: (SHARD_ID, composed_asset_type) => { metadata: "composed".to_string(), supply: 1 }),
             (asset: (compose_tracker, 0, SHARD_ID) => { asset_type: composed_asset_type, quantity: 1 })
         ]);
     }
 
 
     #[test]
+    #[allow(clippy::cyclomatic_complexity)]
     fn decompose_fail_invalid_output_insufficient_amount() {
         let mut state_db = RefCell::new(get_temp_state_db());
         let mut shard_cache = ShardCache::default();
@@ -1795,22 +1795,22 @@ mod tests {
         let mint_tracker = mint.tracker();
         let asset_type = Blake::blake(mint_tracker);
 
-        assert_eq!(Ok(Invoice::Success), state.apply(&mint.into(), &sender, &[], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&mint, &sender, &[], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, SHARD_ID) => { metadata: metadata.clone(), supply: amount }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata.clone(), supply: amount }),
             (asset: (mint_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: amount })
         ]);
 
         let mint2 = asset_mint!(asset_mint_output!(lock_script_hash, supply: 1), "invalid_asset".to_string());
         let mint2_tracker = mint2.tracker();
         let asset_type2 = Blake::blake(mint2_tracker);
-        assert_eq!(Ok(Invoice::Success), state.apply(&mint2.into(), &sender, &[], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&mint2, &sender, &[], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, SHARD_ID) => { metadata: metadata.clone(), supply: amount }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata.clone(), supply: amount }),
             (asset: (mint_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: amount }),
-            (scheme: (asset_type2, SHARD_ID) => { metadata: "invalid_asset".to_string(), supply: 1 }),
+            (scheme: (SHARD_ID, asset_type2) => { metadata: "invalid_asset".to_string(), supply: 1 }),
             (asset: (mint2_tracker, 0, SHARD_ID) => { asset_type: asset_type2, quantity: 1 })
         ]);
 
@@ -1825,14 +1825,14 @@ mod tests {
         let compose_tracker = compose.tracker();
         let composed_asset_type = Blake::blake(compose_tracker);
 
-        assert_eq!(Ok(Invoice::Success), state.apply(&compose.into(), &sender, &[], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&compose, &sender, &[], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, SHARD_ID) => { metadata: metadata.clone(), supply: amount }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata.clone(), supply: amount }),
             (asset: (mint_tracker, 0, SHARD_ID)),
-            (scheme: (asset_type2, SHARD_ID) => { metadata: "invalid_asset".to_string(), supply: 1 }),
+            (scheme: (SHARD_ID, asset_type2) => { metadata: "invalid_asset".to_string(), supply: 1 }),
             (asset: (mint2_tracker, 0, SHARD_ID)),
-            (scheme: (composed_asset_type, SHARD_ID) => { metadata: "composed".to_string(), supply: 1 }),
+            (scheme: (SHARD_ID, composed_asset_type) => { metadata: "composed".to_string(), supply: 1 }),
             (asset: (compose_tracker, 0, SHARD_ID) => { asset_type: composed_asset_type, quantity: 1 })
         ]);
 
@@ -1846,24 +1846,21 @@ mod tests {
         );
 
         assert_eq!(
-            Ok(Invoice::Failure(
-                RuntimeError::InvalidDecomposedOutput {
-                    asset_type,
-                    shard_id: SHARD_ID,
-                    expected: 30,
-                    got: 10,
-                }
-                .into()
-            )),
-            state.apply(&decompose.into(), &sender, &[], &[], &get_test_client())
+            Ok(Invoice::Failure(RuntimeError::InvalidDecomposedOutput {
+                asset_type,
+                shard_id: SHARD_ID,
+                expected: 30,
+                got: 10,
+            })),
+            state.apply(&decompose, &sender, &[], &[], &get_test_client())
         );
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, SHARD_ID) => { metadata: metadata.clone(), supply: amount }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata.clone(), supply: amount }),
             (asset: (mint_tracker, 0, SHARD_ID)),
-            (scheme: (asset_type2, SHARD_ID) => { metadata: "invalid_asset".to_string(), supply: 1 }),
+            (scheme: (SHARD_ID, asset_type2) => { metadata: "invalid_asset".to_string(), supply: 1 }),
             (asset: (mint2_tracker, 0, SHARD_ID)),
-            (scheme: (composed_asset_type, SHARD_ID) => { metadata: "composed".to_string(), supply: 1 }),
+            (scheme: (SHARD_ID, composed_asset_type) => { metadata: "composed".to_string(), supply: 1 }),
             (asset: (compose_tracker, 0, SHARD_ID) => { asset_type: composed_asset_type, quantity: 1 })
         ]);
     }
@@ -1882,23 +1879,22 @@ mod tests {
         let wrap_ccc = asset_wrap_ccc!(tx_hash, asset_wrap_ccc_output!(lock_script_hash, amount));
         let wrap_ccc_tracker = wrap_ccc.tracker();
         let asset_type = H160::zero();
-        let asset_scheme_address = AssetSchemeAddress::new(asset_type, SHARD_ID);
 
         assert_eq!(wrap_ccc_tracker, tx_hash);
         assert_eq!(Ok(Invoice::Success), state.apply(&wrap_ccc, &sender, &[sender], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_scheme_address) => { supply: std::u64::MAX }),
+            (scheme: (SHARD_ID, asset_type) => { supply: std::u64::MAX }),
             (asset: (wrap_ccc_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: amount })
         ]);
 
         let unwrap_ccc =
             asset_unwrap_ccc!(asset_transfer_input!(asset_out_point!(wrap_ccc_tracker, 0, asset_type, 30), vec![0x01]));
 
-        assert_eq!(Ok(Invoice::Success), state.apply(&unwrap_ccc.into(), &sender, &[sender], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&unwrap_ccc, &sender, &[sender], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_scheme_address) => { supply: std::u64::MAX }),
+            (scheme: (SHARD_ID, asset_type) => { supply: std::u64::MAX }),
             (asset: (wrap_ccc_tracker, 0, SHARD_ID))
         ]);
     }
@@ -1921,10 +1917,9 @@ mod tests {
         assert_eq!(Ok(Invoice::Success), state.apply(&wrap_ccc, &sender, &[sender], &[], &get_test_client()));
 
         let asset_type = H160::zero();
-        let asset_scheme_address = AssetSchemeAddress::new(asset_type, SHARD_ID);
 
         check_shard_level_state!(state, [
-            (scheme: (asset_scheme_address) => { supply: std::u64::MAX }),
+            (scheme: (SHARD_ID, asset_type) => { supply: std::u64::MAX }),
             (asset: (wrap_ccc_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: amount })
         ]);
 
@@ -1940,10 +1935,10 @@ mod tests {
         );
         let transfer_tracker = transfer.tracker();
 
-        assert_eq!(Ok(Invoice::Success), state.apply(&transfer.into(), &sender, &[sender], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&transfer, &sender, &[sender], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_scheme_address) => { supply: std::u64::MAX }),
+            (scheme: (SHARD_ID, asset_type) => { supply: std::u64::MAX }),
             (asset: (wrap_ccc_tracker, 0, SHARD_ID)),
             (asset: (transfer_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: 10 }),
             (asset: (transfer_tracker, 1, SHARD_ID) => { asset_type: asset_type, quantity: 5 }),
@@ -1953,10 +1948,10 @@ mod tests {
         let unwrap_ccc =
             asset_unwrap_ccc!(asset_transfer_input!(asset_out_point!(transfer_tracker, 1, asset_type, 5), vec![0x01]));
 
-        assert_eq!(Ok(Invoice::Success), state.apply(&unwrap_ccc.into(), &sender, &[sender], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&unwrap_ccc, &sender, &[sender], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_scheme_address) => { supply: std::u64::MAX }),
+            (scheme: (SHARD_ID, asset_type) => { supply: std::u64::MAX }),
             (asset: (wrap_ccc_tracker, 0, SHARD_ID)),
             (asset: (transfer_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: 10 }),
             (asset: (transfer_tracker, 1, SHARD_ID)),
@@ -1978,10 +1973,10 @@ mod tests {
         let mint_tracker = mint.tracker();
         let asset_type = Blake::blake(mint_tracker);
 
-        assert_eq!(Ok(Invoice::Success), state.apply(&mint.into(), &sender, &[sender], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&mint, &sender, &[sender], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, 0) => { metadata: metadata.clone(), supply: amount }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata.clone(), supply: amount }),
             (asset: (mint_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: amount })
         ]);
 
@@ -1995,18 +1990,15 @@ mod tests {
 
         let sender = address();
         assert_eq!(
-            Ok(Invoice::Failure(
-                RuntimeError::ScriptHashMismatch(Mismatch {
-                    expected: lock_script_hash,
-                    found: Blake::blake(&failed_lock_script),
-                })
-                .into()
-            )),
-            state.apply(&failed_transfer.into(), &sender, &[sender], &[], &get_test_client())
+            Ok(Invoice::Failure(RuntimeError::ScriptHashMismatch(Mismatch {
+                expected: lock_script_hash,
+                found: Blake::blake(&failed_lock_script),
+            }))),
+            state.apply(&failed_transfer, &sender, &[sender], &[], &get_test_client())
         );
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, 0) => { metadata: metadata.clone(), supply: amount }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata.clone(), supply: amount }),
             (asset: (mint_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: amount }),
             (asset: (failed_transfer_tracker, 0, SHARD_ID))
         ]);
@@ -2024,11 +2016,11 @@ mod tests {
 
         assert_eq!(
             Ok(Invoice::Success),
-            state.apply(&successful_transfer.into(), &sender, &[sender], &[], &get_test_client())
+            state.apply(&successful_transfer, &sender, &[sender], &[], &get_test_client())
         );
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, 0) => { metadata: metadata.clone(), supply: amount }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata.clone(), supply: amount }),
             (asset: (mint_tracker, 0, SHARD_ID)),
             (asset: (failed_transfer_tracker, 0, SHARD_ID)),
             (asset: (successful_transfer_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: 10 }),
@@ -2056,10 +2048,10 @@ mod tests {
         let transaction_tracker = transaction.tracker();
         let asset_type = Blake::blake(transaction_tracker);
 
-        assert_eq!(Ok(Invoice::Success), state.apply(&transaction.into(), &sender, &[sender], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&transaction, &sender, &[sender], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, 0) => { metadata: metadata.clone(), supply: ::std::u64::MAX }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata.clone(), supply: ::std::u64::MAX }),
             (asset: (transaction_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: ::std::u64::MAX })
         ]);
     }
@@ -2086,12 +2078,12 @@ mod tests {
         let shard_user = address();
 
         assert_eq!(
-            Ok(Invoice::Failure(RuntimeError::InsufficientPermission.into())),
-            state.apply(&transaction.into(), &sender, &[shard_user], &[], &get_test_client())
+            Ok(Invoice::Failure(RuntimeError::InsufficientPermission)),
+            state.apply(&transaction, &sender, &[shard_user], &[], &get_test_client())
         );
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, 0)),
+            (scheme: (SHARD_ID, asset_type)),
             (asset: (transaction_tracker, 0, SHARD_ID))
         ]);
     }
@@ -2116,10 +2108,10 @@ mod tests {
         let transaction_tracker = transaction.tracker();
         let asset_type = Blake::blake(transaction_tracker);
 
-        assert_eq!(Ok(Invoice::Success), state.apply(&transaction.into(), &sender, &[], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&transaction, &sender, &[], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, 0) => { metadata: metadata.clone(), supply: ::std::u64::MAX, approver: approver }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata.clone(), supply: ::std::u64::MAX, approver: approver }),
             (asset: (transaction_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: ::std::u64::MAX })
         ]);
     }
@@ -2145,10 +2137,10 @@ mod tests {
         let mint_tracker = mint.tracker();
         let asset_type = Blake::blake(mint_tracker);
 
-        assert_eq!(Ok(Invoice::Success), state.apply(&mint.into(), &sender, &[sender], &[], &get_test_client()));
+        assert_eq!(Ok(Invoice::Success), state.apply(&mint, &sender, &[sender], &[], &get_test_client()));
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, 0) => { metadata: metadata.clone(), supply: amount, approver, administrator: administrator }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: metadata.clone(), supply: amount, approver, administrator: administrator }),
             (asset: (mint_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: amount })
         ]);
 
@@ -2164,11 +2156,11 @@ mod tests {
         };
         assert_eq!(
             Ok(Invoice::Success),
-            state.apply(&change_asset_scheme.into(), &sender, &[], &[administrator], &get_test_client())
+            state.apply(&change_asset_scheme, &sender, &[], &[administrator], &get_test_client())
         );
 
         check_shard_level_state!(state, [
-            (scheme: (asset_type, 0) => { metadata: "New metadata".to_string(), supply: amount, approver: approver, administrator }),
+            (scheme: (SHARD_ID, asset_type) => { metadata: "New metadata".to_string(), supply: amount, approver: approver, administrator }),
             (asset: (mint_tracker, 0, SHARD_ID) => { asset_type: asset_type, quantity: amount })
         ]);
     }
