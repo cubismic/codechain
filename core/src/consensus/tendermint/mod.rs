@@ -378,8 +378,6 @@ impl TendermintInner {
             self.votes_received = BitSet::new();
         }
 
-        let same_with_prev_step = prev_step.to_step() == step;
-
         // need to reset vote
         self.broadcast_state(&vote_step, self.proposal, self.votes_received);
         match step {
@@ -411,32 +409,39 @@ impl TendermintInner {
             Step::Prevote => {
                 ctrace!(ENGINE, "move_to_step: Prevote.");
                 self.request_all_votes(&vote_step);
-                let block_hash = match self.lock_change {
-                    Some(ref m) if !self.should_unlock(m.on.step.view) => m.on.block_hash,
-                    _ => self.proposal,
-                };
-                if !same_with_prev_step || is_restoring {
+                if !self.already_generated_message() {
+                    let block_hash = match self.lock_change {
+                        Some(ref m) if !self.should_unlock(m.on.step.view) => m.on.block_hash,
+                        _ => self.proposal,
+                    };
                     self.generate_and_broadcast_message(block_hash, is_restoring);
                 }
             }
             Step::Precommit => {
                 ctrace!(ENGINE, "move_to_step: Precommit.");
                 self.request_all_votes(&vote_step);
-                let block_hash = match self.lock_change {
-                    Some(ref m) if self.is_view(m) && m.on.block_hash.is_some() => {
-                        ctrace!(ENGINE, "Setting last lock: {}", m.on.step.view);
-                        self.last_lock = m.on.step.view;
-                        m.on.block_hash
-                    }
-                    _ => None,
-                };
-                if !same_with_prev_step || is_restoring {
+                if !self.already_generated_message() {
+                    let block_hash = match self.lock_change {
+                        Some(ref m) if self.is_view(m) && m.on.block_hash.is_some() => {
+                            ctrace!(ENGINE, "Setting last lock: {}", m.on.step.view);
+                            self.last_lock = m.on.step.view;
+                            m.on.block_hash
+                        }
+                        _ => None,
+                    };
                     self.generate_and_broadcast_message(block_hash, is_restoring);
                 }
             }
             Step::Commit => {
                 ctrace!(ENGINE, "move_to_step: Commit.");
             }
+        }
+    }
+
+    fn already_generated_message(&self) -> bool {
+        match self.signer_index(&self.prev_block_hash()) {
+            Some(signer_index) => self.votes_received.is_set(signer_index),
+            _ => false,
         }
     }
 
@@ -465,8 +470,8 @@ impl TendermintInner {
                     on,
                 };
                 let message_rlp = message.rlp_bytes().into_vec();
-                self.votes.vote(message.clone());
                 self.votes_received.set(signer_index);
+                self.votes.vote(message.clone());
                 cdebug!(ENGINE, "Generated {:?} as {}th validator.", message, signer_index);
                 self.handle_valid_message(&message, is_restoring);
 

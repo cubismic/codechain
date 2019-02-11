@@ -55,12 +55,12 @@ use util_error::UtilError;
 use crate::cache::{ShardCache, TopCache};
 use crate::checkpoint::{CheckpointId, StateWithCheckpoint};
 use crate::traits::{ShardState, ShardStateView, StateWithCache, TopState, TopStateView};
+#[cfg(test)]
+use crate::Asset;
 use crate::{
     Account, ActionData, FindActionHandler, Metadata, MetadataAddress, RegularAccount, RegularAccountAddress, Shard,
     ShardAddress, ShardLevelState, StateDB, StateError, StateResult, Text,
 };
-#[cfg(test)]
-use crate::{Asset, OwnedAssetAddress};
 
 /// Representation of the entire state of all accounts in the system.
 ///
@@ -129,7 +129,7 @@ impl TopStateView for TopLevelState {
             // FIXME: Find a way to use stored cache.
             Some(shard_root) => {
                 let shard_cache = self.shard_caches.get(&shard_id).cloned().unwrap_or_default();
-                Ok(Some(Box::new(ShardLevelState::read_only(&self.db, shard_root, shard_cache)?)))
+                Ok(Some(Box::new(ShardLevelState::read_only(shard_id, &self.db, shard_root, shard_cache)?)))
             }
             None => Ok(None),
         }
@@ -223,16 +223,6 @@ impl StateWithCheckpoint for TopLevelState {
 }
 
 impl TopLevelState {
-    /// Creates new state with empty state root
-    /// Used for tests.
-    pub fn new_for_testing(mut db: StateDB) -> Self {
-        let mut root = H256::new();
-        // init trie and reset root too null
-        let _ = TrieFactory::create(db.as_hashdb_mut(), &mut root);
-
-        Self::from_existing(db, root).expect("The empty trie root was initialized")
-    }
-
     /// Creates new state with existing state root
     pub fn from_existing(db: StateDB, root: H256) -> Result<Self, TrieError> {
         if !db.as_hashdb().contains(&root) {
@@ -736,8 +726,7 @@ impl TopLevelState {
             Some(shard_root) => {
                 let mut shard_cache = self.shard_caches.entry(shard_id).or_default();
                 let state = ShardLevelState::from_existing(shard_id, &mut self.db, shard_root, &mut shard_cache)?;
-                let a = OwnedAssetAddress::new(tx_hash, index, shard_id);
-                state.create_asset(&a, asset_type, lock_script_hash, parameters, amount, order_hash)?;
+                state.create_asset(tx_hash, index, asset_type, lock_script_hash, parameters, amount, order_hash)?;
                 Ok(true)
             }
             None => Ok(false),
@@ -928,7 +917,7 @@ mod tests_state {
     use journaldb::{self, Algorithm};
 
     use super::*;
-    use crate::tests::helpers::{get_memory_db, get_temp_state, get_temp_state_db};
+    use crate::tests::helpers::{empty_top_state, get_memory_db, get_temp_state, get_temp_state_db};
 
     #[test]
     fn work_when_cloned() {
@@ -994,7 +983,7 @@ mod tests_state {
         let db = StateDB::new(jorunal.boxed_clone());
         let a = Address::default();
         let root = {
-            let mut state = TopLevelState::new_for_testing(StateDB::new(jorunal));
+            let mut state = empty_top_state(StateDB::new(jorunal));
             assert_eq!(Ok(()), state.inc_seq(&a));
             assert_eq!(Ok(()), state.add_balance(&a, 100));
             assert_eq!(Ok(100), state.balance(&a));
@@ -1025,7 +1014,7 @@ mod tests_state {
         let mut db = StateDB::new(jorunal.boxed_clone());
         let a = Address::default();
         let root = {
-            let mut state = TopLevelState::new_for_testing(StateDB::new(jorunal));
+            let mut state = empty_top_state(StateDB::new(jorunal));
             assert_eq!(Ok(()), state.inc_seq(&a));
             assert_eq!(Ok(()), state.add_balance(&a, 69));
             assert_eq!(Ok(69), state.balance(&a));
@@ -1072,7 +1061,7 @@ mod tests_state {
         let a = Address::default();
         let mut db = get_temp_state_db();
         let root = {
-            let mut state = TopLevelState::new_for_testing(db.clone(&H256::zero()));
+            let mut state = empty_top_state(db.clone(&H256::zero()));
             assert_eq!(Ok(()), state.add_balance(&a, 0)); // create an empty account
             let root = state.commit();
             assert!(root.is_ok(), "{:?}", root);
@@ -1096,7 +1085,7 @@ mod tests_state {
         let jorunal = journaldb::new(Arc::clone(&memory_db), Algorithm::Archive, Some(0));
         let mut db = StateDB::new(jorunal.boxed_clone());
         let root = {
-            let mut state = TopLevelState::new_for_testing(StateDB::new(jorunal));
+            let mut state = empty_top_state(StateDB::new(jorunal));
             assert_eq!(Ok(()), state.inc_seq(&a));
             let root = state.commit();
             assert!(root.is_ok(), "{:?}", root);
@@ -1812,7 +1801,10 @@ mod tests_tx {
         let transaction_tracker = transaction.tracker().unwrap();
         let tx = transaction!(seq: 1, fee: 11, transaction);
         assert_eq!(
-            Ok(Invoice::Failure(RuntimeError::AssetSchemeDuplicated(transaction_tracker))),
+            Ok(Invoice::Failure(RuntimeError::AssetSchemeDuplicated {
+                tracker: transaction_tracker,
+                shard_id
+            })),
             state.apply(&tx, &H256::random(), &sender_public, &get_test_client())
         );
 
