@@ -42,6 +42,7 @@ pub enum Error {
         asset_type: H160,
         shard_id: ShardId,
     },
+    AssetSupplyOverflow,
     CannotBurnCentralizedAsset,
     CannotComposeCentralizedAsset,
     /// Script execution result is `Fail`
@@ -51,7 +52,6 @@ pub enum Error {
         index: usize,
         reason: UnlockFailureReason,
     },
-    InconsistentShardOutcomes,
     /// Sender doesn't have enough funds to pay for this Transaction
     InsufficientBalance {
         address: Address,
@@ -109,7 +109,6 @@ const ERROR_ID_ASSET_SCHEME_NOT_FOUND: u8 = 3;
 const ERROR_ID_CANNOT_BURN_CENTRALIZED_ASSET: u8 = 4;
 const ERROR_ID_CANNOT_COMPOSE_CENTRALIZED_ASSET: u8 = 5;
 const ERROR_ID_FAILED_TO_UNLOCK: u8 = 6;
-const ERROR_ID_INCONSISTENT_SHARD_OUTCOMES: u8 = 7;
 const ERROR_ID_INSUFFICIENT_BALANCE: u8 = 8;
 const ERROR_ID_INSUFFICIENT_PERMISSION: u8 = 9;
 const ERROR_ID_INVALID_ASSET_QUANTITY: u8 = 10;
@@ -130,6 +129,7 @@ const ERROR_ID_CANNOT_USE_MASTER_KEY: u8 = 25;
 const ERROR_ID_INVALID_ORIGIN_OUTPUTS: u8 = 26;
 const ERROR_ID_INVALID_SCRIPT: u8 = 27;
 const ERROR_ID_INVALID_SEQ: u8 = 28;
+const ERROR_ID_ASSET_SUPPLY_OVERFLOW: u8 = 29;
 
 struct RlpHelper;
 impl TaggedRlp for RlpHelper {
@@ -140,10 +140,10 @@ impl TaggedRlp for RlpHelper {
             ERROR_ID_ASSET_NOT_FOUND => 4,
             ERROR_ID_ASSET_SCHEME_DUPLICATED => 3,
             ERROR_ID_ASSET_SCHEME_NOT_FOUND => 3,
+            ERROR_ID_ASSET_SUPPLY_OVERFLOW => 1,
             ERROR_ID_CANNOT_BURN_CENTRALIZED_ASSET => 1,
             ERROR_ID_CANNOT_COMPOSE_CENTRALIZED_ASSET => 1,
             ERROR_ID_FAILED_TO_UNLOCK => 5,
-            ERROR_ID_INCONSISTENT_SHARD_OUTCOMES => 1,
             ERROR_ID_INSUFFICIENT_BALANCE => 4,
             ERROR_ID_INSUFFICIENT_PERMISSION => 1,
             ERROR_ID_INVALID_ASSET_QUANTITY => 6,
@@ -185,6 +185,7 @@ impl Encodable for Error {
                 asset_type,
                 shard_id,
             } => RlpHelper::new_tagged_list(s, ERROR_ID_ASSET_SCHEME_NOT_FOUND).append(asset_type).append(shard_id),
+            Error::AssetSupplyOverflow => RlpHelper::new_tagged_list(s, ERROR_ID_ASSET_SUPPLY_OVERFLOW),
             Error::CannotBurnCentralizedAsset => RlpHelper::new_tagged_list(s, ERROR_ID_CANNOT_BURN_CENTRALIZED_ASSET),
             Error::CannotComposeCentralizedAsset => {
                 RlpHelper::new_tagged_list(s, ERROR_ID_CANNOT_COMPOSE_CENTRALIZED_ASSET)
@@ -199,7 +200,6 @@ impl Encodable for Error {
                 .append(tracker)
                 .append(index)
                 .append(reason),
-            Error::InconsistentShardOutcomes => RlpHelper::new_tagged_list(s, ERROR_ID_INCONSISTENT_SHARD_OUTCOMES),
             Error::InsufficientBalance {
                 address,
                 balance,
@@ -285,6 +285,7 @@ impl Decodable for Error {
                 asset_type: rlp.val_at(1)?,
                 shard_id: rlp.val_at(2)?,
             },
+            ERROR_ID_ASSET_SUPPLY_OVERFLOW => Error::AssetSupplyOverflow,
             ERROR_ID_CANNOT_BURN_CENTRALIZED_ASSET => Error::CannotBurnCentralizedAsset,
             ERROR_ID_CANNOT_COMPOSE_CENTRALIZED_ASSET => Error::CannotComposeCentralizedAsset,
             ERROR_ID_FAILED_TO_UNLOCK => Error::FailedToUnlock {
@@ -293,7 +294,6 @@ impl Decodable for Error {
                 index: rlp.val_at(3)?,
                 reason: rlp.val_at(4)?,
             },
-            ERROR_ID_INCONSISTENT_SHARD_OUTCOMES => Error::InconsistentShardOutcomes,
             ERROR_ID_INSUFFICIENT_BALANCE => Error::InsufficientBalance {
                 address: rlp.val_at(1)?,
                 balance: rlp.val_at(2)?,
@@ -349,6 +349,7 @@ impl Display for Error {
                 asset_type,
                 shard_id,
             } => write!(f, "Asset scheme not found: {}:{}", asset_type, shard_id),
+            Error::AssetSupplyOverflow => write!(f, "Asset supply should not be overflowed"),
             Error::CannotBurnCentralizedAsset => write!(f, "Cannot burn the centralized asset"),
             Error::CannotComposeCentralizedAsset => write!(f, "Cannot compose the centralized asset"),
             Error::FailedToUnlock {
@@ -357,7 +358,6 @@ impl Display for Error {
                 index,
                 reason,
             } => write!(f, "Failed to unlock asset {}:{}:{}, reason: {}", shard_id, tracker, index, reason),
-            Error::InconsistentShardOutcomes => write!(f, "Shard outcomes are inconsistent"),
             Error::InsufficientBalance {
                 address,
                 balance,

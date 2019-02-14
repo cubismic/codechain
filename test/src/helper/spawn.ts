@@ -22,7 +22,6 @@ import {
     ComposeAsset,
     DecomposeAsset,
     H256,
-    Invoice,
     PlatformAddress,
     SignedTransaction,
     Transaction,
@@ -378,11 +377,9 @@ export default class CodeChain {
         const hash = await this.sdk.rpc.chain.sendSignedTransaction(tx);
         const invoice = (await this.sdk.rpc.chain.getInvoice(hash, {
             timeout: 300 * 1000
-        })) as Invoice | null;
-        if (invoice === null || !invoice.success) {
-            throw Error(
-                `An error occurred while pay: ${invoice && invoice.error}`
-            );
+        })) as boolean | null;
+        if (!invoice) {
+            throw Error("An error occurred while pay");
         }
     }
 
@@ -437,11 +434,12 @@ export default class CodeChain {
     }
 
     public async mintAsset(params: {
-        supply: number;
+        supply: U64 | number;
         recipient?: string | AssetTransferAddress;
         secret?: string;
         seq?: number;
         metadata?: string;
+        administrator?: PlatformAddress | string;
         awaitMint?: boolean;
     }) {
         const {
@@ -450,13 +448,15 @@ export default class CodeChain {
             recipient = await this.createP2PKHAddress(),
             secret,
             metadata = "",
+            administrator,
             awaitMint = true
         } = params;
         const tx = this.sdk.core.createMintAssetTransaction({
             scheme: {
                 shardId: 0,
                 metadata,
-                supply
+                supply,
+                administrator
             },
             recipient
         });
@@ -522,7 +522,7 @@ export default class CodeChain {
         if (awaitInvoice) {
             return (await this.sdk.rpc.chain.getInvoice(hash, {
                 timeout: 300 * 1000
-            })) as Invoice;
+            })) as boolean;
         }
     }
 

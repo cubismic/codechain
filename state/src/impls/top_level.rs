@@ -43,7 +43,9 @@ use ckey::{public_to_address, recover, verify_address, Address, NetworkId, Publi
 use cmerkle::{Result as TrieResult, TrieError, TrieFactory};
 use ctypes::errors::RuntimeError;
 use ctypes::invoice::Invoice;
-use ctypes::transaction::{Action, AssetWrapCCCOutput, ShardTransaction, Transaction};
+use ctypes::transaction::{
+    Action, AssetOutPoint, AssetTransferInput, AssetWrapCCCOutput, ShardTransaction, Transaction,
+};
 use ctypes::util::unexpected::Mismatch;
 use ctypes::ShardId;
 use cvm::ChainTimeInfo;
@@ -260,7 +262,7 @@ impl TopLevelState {
             }
             Err(StateError::Runtime(err)) => {
                 self.discard_checkpoint(FEE_CHECKPOINT);
-                Ok(Invoice::Failure(err))
+                Ok(Invoice::Failure(err.to_string()))
             }
             Err(err) => {
                 self.revert_to_checkpoint(FEE_CHECKPOINT);
@@ -318,10 +320,10 @@ impl TopLevelState {
         let result =
             self.apply_action(&tx.action, tx.network_id, tx.hash(), signed_hash, &fee_payer, signer_public, client);
         match &result {
-            Ok(_) => {
+            Ok(Invoice::Success) => {
                 self.discard_checkpoint(ACTION_CHECKPOINT);
             }
-            Err(StateError::Runtime(_)) => {
+            Ok(Invoice::Failure(_)) => {
                 self.revert_to_checkpoint(ACTION_CHECKPOINT);
             }
             Err(_) => {
@@ -345,10 +347,16 @@ impl TopLevelState {
             Action::MintAsset {
                 approvals,
                 ..
+            }
+            | Action::ChangeAssetScheme {
+                approvals,
+                ..
+            }
+            | Action::IncreaseAssetSupply {
+                approvals,
+                ..
             } => {
-                let transaction = Option::<ShardTransaction>::from(action.clone()).expect("It's a mint transaction");
-                debug_assert_eq!(network_id, transaction.network_id());
-
+                let transaction = Option::<ShardTransaction>::from(action.clone()).expect("It's a shard transaction");
                 let transaction_tracker = transaction.tracker();
                 let approvers = approvals
                     .iter()
@@ -357,67 +365,23 @@ impl TopLevelState {
                         self.public_to_owner_address(&public)
                     })
                     .collect::<StateResult<Vec<_>>>()?;
-                Ok(self.apply_shard_transaction(&transaction, fee_payer, &approvers, client)?)
+                let shard_ids = transaction.related_shards();
+                assert_eq!(1, shard_ids.len());
+                Ok(self.apply_shard_transaction_to_shard(&transaction, shard_ids[0], fee_payer, &approvers, client)?)
             }
             Action::TransferAsset {
                 approvals,
                 ..
-            } => {
-                let transaction =
-                    Option::<ShardTransaction>::from(action.clone()).expect("It's a transfer transaction");
-                debug_assert_eq!(network_id, transaction.network_id());
-
-                let transaction_tracker = transaction.tracker();
-                let approvers = approvals
-                    .iter()
-                    .map(|signature| {
-                        let public = recover(&signature, &transaction_tracker)?;
-                        self.public_to_owner_address(&public)
-                    })
-                    .collect::<StateResult<Vec<_>>>()?;
-                Ok(self.apply_shard_transaction(&transaction, fee_payer, &approvers, client)?)
             }
-            Action::ChangeAssetScheme {
+            | Action::ComposeAsset {
+                approvals,
+                ..
+            }
+            | Action::DecomposeAsset {
                 approvals,
                 ..
             } => {
-                let transaction =
-                    Option::<ShardTransaction>::from(action.clone()).expect("It's a change scheme transaction");
-                debug_assert_eq!(network_id, transaction.network_id());
-
-                let transaction_tracker = transaction.tracker();
-                let approvers = approvals
-                    .iter()
-                    .map(|signature| {
-                        let public = recover(&signature, &transaction_tracker)?;
-                        self.public_to_owner_address(&public)
-                    })
-                    .collect::<StateResult<Vec<_>>>()?;
-                Ok(self.apply_shard_transaction(&transaction, fee_payer, &approvers, client)?)
-            }
-            Action::ComposeAsset {
-                approvals,
-                ..
-            } => {
-                let transaction = Option::<ShardTransaction>::from(action.clone()).expect("It's a compose transaction");
-                debug_assert_eq!(network_id, transaction.network_id());
-
-                let transaction_tracker = transaction.tracker();
-                let approvers = approvals
-                    .iter()
-                    .map(|signature| {
-                        let public = recover(&signature, &transaction_tracker)?;
-                        self.public_to_owner_address(&public)
-                    })
-                    .collect::<StateResult<Vec<_>>>()?;
-                Ok(self.apply_shard_transaction(&transaction, fee_payer, &approvers, client)?)
-            }
-            Action::DecomposeAsset {
-                approvals,
-                ..
-            } => {
-                let transaction =
-                    Option::<ShardTransaction>::from(action.clone()).expect("It's a decompose transaction");
+                let transaction = Option::<ShardTransaction>::from(action.clone()).expect("It's a shard transaction");
                 debug_assert_eq!(network_id, transaction.network_id());
 
                 let transaction_tracker = transaction.tracker();
@@ -431,11 +395,24 @@ impl TopLevelState {
                 Ok(self.apply_shard_transaction(&transaction, fee_payer, &approvers, client)?)
             }
             Action::UnwrapCCC {
+                burn:
+                    AssetTransferInput {
+                        prev_out:
+                            AssetOutPoint {
+                                quantity,
+                                ..
+                            },
+                        ..
+                    },
                 ..
             } => {
                 let transaction = Option::<ShardTransaction>::from(action.clone()).expect("It's an unwrap transaction");
                 debug_assert_eq!(network_id, transaction.network_id());
-                Ok(self.apply_shard_transaction(&transaction, fee_payer, &[], client)?)
+                let invoice = self.apply_shard_transaction(&transaction, fee_payer, &[], client)?;
+                if invoice == Invoice::Success {
+                    self.add_balance(fee_payer, *quantity)?;
+                }
+                Ok(invoice)
             }
             Action::Pay {
                 receiver,
@@ -473,6 +450,7 @@ impl TopLevelState {
                 lock_script_hash,
                 parameters,
                 quantity,
+                ..
             } => Ok(self.apply_wrap_ccc(
                 network_id,
                 *shard_id,
@@ -539,7 +517,8 @@ impl TopLevelState {
 
         let shard_cache = self.shard_caches.entry(shard_id).or_default();
         let mut shard_level_state = ShardLevelState::from_existing(shard_id, &mut self.db, shard_root, shard_cache)?;
-        Ok(shard_level_state.apply(&transaction, sender, &shard_users, &[], client)?)
+        shard_level_state.apply(&transaction, sender, &shard_users, &[], client)?;
+        Ok(Invoice::Success)
     }
 
     pub fn apply_shard_transaction<C: ChainTimeInfo>(
@@ -549,23 +528,27 @@ impl TopLevelState {
         approvers: &[Address],
         client: &C,
     ) -> StateResult<Invoice> {
-        let shard_ids = transaction.related_shards();
-
-        let first_invoice =
-            self.apply_shard_transaction_to_shard(transaction, shard_ids[0], sender, approvers, client)?;
-
-        for shard_id in shard_ids.iter().skip(1) {
-            let invoice = self.apply_shard_transaction_to_shard(transaction, *shard_id, sender, approvers, client)?;
-            if invoice != first_invoice {
-                return Err(RuntimeError::InconsistentShardOutcomes.into())
-            }
+        let invoices: Vec<_> = transaction
+            .related_shards()
+            .into_iter()
+            .map(|shard_id| self.apply_shard_transaction_to_shard(transaction, shard_id, sender, approvers, client))
+            .collect::<Result<_, _>>()?;
+        assert_ne!(0, invoices.len());
+        let failed: Vec<_> = invoices
+            .into_iter()
+            .filter_map(|invoice| {
+                if let Invoice::Failure(err) = invoice {
+                    Some(err)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if failed.is_empty() {
+            Ok(Invoice::Success)
+        } else {
+            Ok(Invoice::Failure(failed.join("\n")))
         }
-
-        if first_invoice == Invoice::Success {
-            let unwrapped_quantity = transaction.unwrapped_quantity();
-            self.add_balance(sender, unwrapped_quantity)?;
-        }
-        Ok(first_invoice)
     }
 
     fn apply_shard_transaction_to_shard<C: ChainTimeInfo>(
@@ -581,7 +564,16 @@ impl TopLevelState {
 
         let shard_cache = self.shard_caches.entry(shard_id).or_default();
         let mut shard_level_state = ShardLevelState::from_existing(shard_id, &mut self.db, shard_root, shard_cache)?;
-        shard_level_state.apply(&transaction.clone(), sender, &shard_users, approvers, client)
+        shard_level_state
+            .apply(&transaction, sender, &shard_users, approvers, client)
+            .and(Ok(Invoice::Success))
+            .or_else(|e| {
+                if let StateError::Runtime(err) = e {
+                    Ok(Invoice::Failure(err.to_string()))
+                } else {
+                    Err(e)
+                }
+            })
     }
 
     fn create_shard_level_state(
@@ -1279,10 +1271,13 @@ mod tests_tx {
 
         let tx = transaction!(seq: 2, fee: 5, pay!(address().0, 10));
         assert_eq!(
-            Ok(Invoice::Failure(RuntimeError::InvalidSeq(Mismatch {
-                expected: 0,
-                found: 2
-            }))),
+            Ok(Invoice::Failure(
+                RuntimeError::InvalidSeq(Mismatch {
+                    expected: 0,
+                    found: 2
+                })
+                .to_string()
+            )),
             state.apply(&tx, &H256::random(), &sender_public, &get_test_client())
         );
 
@@ -1300,11 +1295,14 @@ mod tests_tx {
 
         let tx = transaction!(fee: 5, pay!(address().0, 10));
         assert_eq!(
-            Ok(Invoice::Failure(RuntimeError::InsufficientBalance {
-                address: sender,
-                balance: 4,
-                cost: 5,
-            })),
+            Ok(Invoice::Failure(
+                RuntimeError::InsufficientBalance {
+                    address: sender,
+                    balance: 4,
+                    cost: 5,
+                }
+                .to_string()
+            )),
             state.apply(&tx, &H256::random(), &sender_public, &get_test_client())
         );
 
@@ -1400,7 +1398,7 @@ mod tests_tx {
 
         let tx = transaction!(fee: 5, set_regular_key!(*key));
         assert_eq!(
-            Ok(Invoice::Failure(RuntimeError::RegularKeyAlreadyInUse)),
+            Ok(Invoice::Failure(RuntimeError::RegularKeyAlreadyInUse.to_string())),
             state.apply(&tx, &H256::random(), &sender_public2, &get_test_client())
         );
 
@@ -1423,7 +1421,7 @@ mod tests_tx {
 
         let tx = transaction! (fee: 5, set_regular_key!(sender_public2));
         assert_eq!(
-            Ok(Invoice::Failure(RuntimeError::RegularKeyAlreadyInUseAsPlatformAccount)),
+            Ok(Invoice::Failure(RuntimeError::RegularKeyAlreadyInUseAsPlatformAccount.to_string())),
             state.apply(&tx, &H256::random(), &sender_public, &get_test_client())
         );
 
@@ -1577,7 +1575,7 @@ mod tests_tx {
 
         let tx = transaction!(fee: 5, pay!(regular_address, 5));
         assert_eq!(
-            Ok(Invoice::Failure(RuntimeError::InvalidTransferDestination)),
+            Ok(Invoice::Failure(RuntimeError::InvalidTransferDestination.to_string())),
             state.apply(&tx, &H256::random(), &sender_public, &get_test_client())
         );
 
@@ -1601,7 +1599,7 @@ mod tests_tx {
 
         let tx = transaction!(fee: 5, pay!(receiver_address, 5));
         assert_eq!(
-            Ok(Invoice::Failure(RuntimeError::CannotUseMasterKey)),
+            Ok(Invoice::Failure(RuntimeError::CannotUseMasterKey.to_string())),
             state.apply(&tx, &H256::random(), &sender_public, &get_test_client())
         );
 
@@ -1623,11 +1621,14 @@ mod tests_tx {
         let tx = transaction!(fee: 5, pay!(receiver, 30));
 
         assert_eq!(
-            Ok(Invoice::Failure(RuntimeError::InsufficientBalance {
-                address: sender,
-                balance: 15,
-                cost: 30,
-            })),
+            Ok(Invoice::Failure(
+                RuntimeError::InsufficientBalance {
+                    address: sender,
+                    balance: 15,
+                    cost: 30,
+                }
+                .to_string()
+            )),
             state.apply(&tx, &H256::random(), &sender_public, &get_test_client())
         );
 
@@ -1801,10 +1802,13 @@ mod tests_tx {
         let transaction_tracker = transaction.tracker().unwrap();
         let tx = transaction!(seq: 1, fee: 11, transaction);
         assert_eq!(
-            Ok(Invoice::Failure(RuntimeError::AssetSchemeDuplicated {
-                tracker: transaction_tracker,
-                shard_id
-            })),
+            Ok(Invoice::Failure(
+                RuntimeError::AssetSchemeDuplicated {
+                    tracker: transaction_tracker,
+                    shard_id
+                }
+                .to_string()
+            )),
             state.apply(&tx, &H256::random(), &sender_public, &get_test_client())
         );
 
@@ -1887,10 +1891,13 @@ mod tests_tx {
         let tx = transaction!(seq: 1, fee: 11, unwrap_ccc_tx);
 
         assert_eq!(
-            Ok(Invoice::Failure(RuntimeError::ScriptHashMismatch(Mismatch {
-                expected: lock_script_hash,
-                found: Blake::blake(&failed_lock_script),
-            }))),
+            Ok(Invoice::Failure(
+                RuntimeError::ScriptHashMismatch(Mismatch {
+                    expected: lock_script_hash,
+                    found: Blake::blake(&failed_lock_script),
+                })
+                .to_string()
+            )),
             state.apply(&tx, &H256::random(), &sender_public, &get_test_client())
         );
 
@@ -1918,11 +1925,14 @@ mod tests_tx {
         let tx = transaction!(fee: 11, wrap_ccc!(lock_script_hash, quantity));
 
         assert_eq!(
-            Ok(Invoice::Failure(RuntimeError::InsufficientBalance {
-                address: sender,
-                balance: 9,
-                cost: 30,
-            })),
+            Ok(Invoice::Failure(
+                RuntimeError::InsufficientBalance {
+                    address: sender,
+                    balance: 9,
+                    cost: 30,
+                }
+                .to_string()
+            )),
             state.apply(&tx, &H256::random(), &sender_public, &get_test_client())
         );
 
@@ -2056,7 +2066,7 @@ mod tests_tx {
         let tx = transaction!(fee: 10, store!(content.clone(), sender, signature));
 
         assert_eq!(
-            Ok(Invoice::Failure(RuntimeError::TextVerificationFail("Invalid Signature".to_string()))),
+            Ok(Invoice::Failure(RuntimeError::TextVerificationFail("Invalid Signature".to_string()).to_string())),
             state.apply(&tx, &H256::random(), &sender_public, &get_test_client())
         );
 
@@ -2070,7 +2080,9 @@ mod tests_tx {
         let tx = transaction!(seq: 1, fee: 10, store!(content.clone(), sender, signature));
 
         assert_eq!(
-            Ok(Invoice::Failure(RuntimeError::TextVerificationFail("Certifier and signer are different".to_string()))),
+            Ok(Invoice::Failure(
+                RuntimeError::TextVerificationFail("Certifier and signer are different".to_string()).to_string()
+            )),
             state.apply(&tx, &H256::random(), &sender_public, &get_test_client())
         );
 
@@ -2097,7 +2109,7 @@ mod tests_tx {
         let remove_tx = transaction!(fee: 10, remove!(hash, signature));
 
         assert_eq!(
-            Ok(Invoice::Failure(RuntimeError::TextNotExist)),
+            Ok(Invoice::Failure(RuntimeError::TextNotExist.to_string())),
             state.apply(&remove_tx, &H256::random(), &sender_public, &get_test_client())
         );
 
@@ -2289,7 +2301,7 @@ mod tests_tx {
         let tx = transaction!(fee: 11, transaction);
 
         assert_eq!(
-            Ok(Invoice::Failure(RuntimeError::InvalidShardId(0))),
+            Ok(Invoice::Failure(RuntimeError::InvalidShardId(0).to_string())),
             state.apply(&tx, &H256::random(), &sender_public, &get_test_client())
         );
 
@@ -2326,7 +2338,7 @@ mod tests_tx {
         let tx = transaction!(fee: 30, transfer);
 
         assert_eq!(
-            Ok(Invoice::Failure(RuntimeError::InvalidShardId(100))),
+            Ok(Invoice::Failure(RuntimeError::InvalidShardId(100).to_string())),
             state.apply(&tx, &H256::random(), &sender_public, &get_test_client())
         );
         check_top_level_state!(state, [
@@ -2374,7 +2386,7 @@ mod tests_tx {
         let owners = vec![Address::random(), Address::random()];
         let tx = transaction!(fee: 5, set_shard_owners!(owners));
         assert_eq!(
-            Ok(Invoice::Failure(RuntimeError::NewOwnersMustContainSender)),
+            Ok(Invoice::Failure(RuntimeError::NewOwnersMustContainSender.to_string())),
             state.apply(&tx, &H256::random(), &sender_public, &get_test_client())
         );
         check_top_level_state!(state, [
@@ -2401,7 +2413,7 @@ mod tests_tx {
         let tx = transaction!(fee: 5, set_shard_owners!(owners));
 
         assert_eq!(
-            Ok(Invoice::Failure(RuntimeError::InsufficientPermission)),
+            Ok(Invoice::Failure(RuntimeError::InsufficientPermission.to_string())),
             state.apply(&tx, &H256::random(), &sender_public, &get_test_client())
         );
 
@@ -2428,7 +2440,7 @@ mod tests_tx {
         let tx = transaction!(fee: 5, set_shard_owners!(shard_id: invalid_shard_id, owners));
 
         assert_eq!(
-            Ok(Invoice::Failure(RuntimeError::InvalidShardId(invalid_shard_id))),
+            Ok(Invoice::Failure(RuntimeError::InvalidShardId(invalid_shard_id).to_string())),
             state.apply(&tx, &H256::random(), &sender_public, &get_test_client())
         );
 
@@ -2456,7 +2468,7 @@ mod tests_tx {
 
         let tx = transaction!(fee: 5, set_shard_owners!(owners));
         assert_eq!(
-            Ok(Invoice::Failure(RuntimeError::InsufficientPermission)),
+            Ok(Invoice::Failure(StateError::Runtime(RuntimeError::InsufficientPermission).to_string())),
             state.apply(&tx, &H256::random(), &sender_public, &get_test_client())
         );
 
@@ -2492,7 +2504,7 @@ mod tests_tx {
 
         let tx = transaction!(fee: 20, mint);
 
-        assert_eq!(Invoice::Success, state.apply(&tx, &H256::random(), &sender_public, &get_test_client()).unwrap());
+        assert_eq!(Ok(Invoice::Success), state.apply(&tx, &H256::random(), &sender_public, &get_test_client()));
 
         check_top_level_state!(state, [
             (account: sender => (seq: 1, balance: 100 - 20)),
@@ -2542,12 +2554,264 @@ mod tests_tx {
         let tx = transaction!(fee: 5, set_shard_users!(new_users.clone()));
 
         assert_eq!(
-            Ok(Invoice::Failure(RuntimeError::InsufficientPermission)),
+            Ok(Invoice::Failure(RuntimeError::InsufficientPermission.to_string())),
             state.apply(&tx, &H256::random(), &sender_public, &get_test_client())
         );
         check_top_level_state!(state, [
             (account: sender => (seq: 1, balance: 100 - 5)),
             (shard: 0 => owners: owners, users: old_users)
+        ]);
+    }
+
+    #[test]
+    fn multi_shard_transfer() {
+        let shard3 = 3;
+        let shard4 = 4;
+
+        let mint_tracker3 = H256::random();
+        let mint_tracker4 = H256::random();
+        let asset_type3 = Blake::blake(mint_tracker3);
+        let asset_type4 = Blake::blake(mint_tracker4);
+        let lock_script_hash = H160::from("0xb042ad154a3359d276835c903587ebafefea22af");
+
+        let (sender, signer_public, _) = address();
+
+        let mut state = get_temp_state();
+        set_top_level_state!(state, [
+            (shard: 0 => owners: [address().0]),
+            (shard: 1 => owners: [address().0]),
+            (shard: 2 => owners: [address().0]),
+            (shard: shard3 => owners: [address().0]),
+            (shard: shard4 => owners: [address().0]),
+            (metadata: shards: 5),
+            (account: sender => balance: 25),
+            (scheme: (shard3, asset_type3) => { supply: 10, metadata: "asset on shard 3".to_string() }),
+            (scheme: (shard4, asset_type4) => { supply: 20, metadata: "asset on shard 4".to_string() }),
+            (asset: (shard3, mint_tracker3, 0) => { asset_type: asset_type3, quantity: 10, lock_script_hash: lock_script_hash }),
+            (asset: (shard4, mint_tracker4, 0) => { asset_type: asset_type4, quantity: 20, lock_script_hash: lock_script_hash })
+        ]);
+
+        let transfer = transfer_asset!(
+            inputs:
+                asset_transfer_inputs![
+                    (asset_out_point!(mint_tracker3, 0, asset_type3, shard3, 10), vec![0x30, 0x01]),
+                    (asset_out_point!(mint_tracker4, 0, asset_type4, shard4, 20), vec![0x30, 0x01])
+                ],
+            asset_transfer_outputs![
+                (lock_script_hash, vec![vec![1]], asset_type3, shard3, 10),
+                (lock_script_hash, vec![vec![1]], asset_type4, shard4, 20)
+            ]
+        );
+        let transfer_tracker = transfer.tracker().unwrap();
+        let transfer_tx = transaction!(seq: 0, fee: 11, transfer);
+
+        assert_eq!(
+            Ok(Invoice::Success),
+            state.apply(&transfer_tx, &H256::random(), &signer_public, &get_test_client())
+        );
+        check_top_level_state!(state, [
+            (account: sender => (seq: 1, balance: 25 - 11)),
+            (scheme: (shard3, asset_type3) => { supply: 10 }),
+            (scheme: (shard4, asset_type4) => { supply: 20 }),
+            (asset: (mint_tracker3, 0, shard3)),
+            (asset: (mint_tracker4, 0, shard4)),
+            (asset: (transfer_tracker, 0, shard3) => { asset_type: asset_type3, quantity: 10 }),
+            (asset: (transfer_tracker, 1, shard3)),
+            (asset: (transfer_tracker, 0, shard4)),
+            (asset: (transfer_tracker, 1, shard4) => { asset_type: asset_type4, quantity: 20 })
+        ]);
+    }
+
+    #[test]
+    fn multi_shard_transfer_in_cross_order() {
+        let shard3 = 3;
+        let shard4 = 4;
+
+        let mint_tracker3 = H256::random();
+        let mint_tracker4 = H256::random();
+        let asset_type3 = Blake::blake(mint_tracker3);
+        let asset_type4 = Blake::blake(mint_tracker4);
+        let lock_script_hash = H160::from("0xb042ad154a3359d276835c903587ebafefea22af");
+
+        let (sender, signer_public, _) = address();
+
+        let mut state = get_temp_state();
+        set_top_level_state!(state, [
+            (shard: 0 => owners: [address().0]),
+            (shard: 1 => owners: [address().0]),
+            (shard: 2 => owners: [address().0]),
+            (shard: shard3 => owners: [address().0]),
+            (shard: shard4 => owners: [address().0]),
+            (metadata: shards: 5),
+            (account: sender => balance: 25),
+            (scheme: (shard3, asset_type3) => { supply: 10, metadata: "asset on shard 3".to_string() }),
+            (scheme: (shard4, asset_type4) => { supply: 20, metadata: "asset on shard 4".to_string() }),
+            (asset: (shard3, mint_tracker3, 0) => { asset_type: asset_type3, quantity: 10, lock_script_hash: lock_script_hash }),
+            (asset: (shard4, mint_tracker4, 0) => { asset_type: asset_type4, quantity: 20, lock_script_hash: lock_script_hash })
+        ]);
+
+        let transfer = transfer_asset!(
+            inputs:
+                asset_transfer_inputs![
+                    (asset_out_point!(mint_tracker4, 0, asset_type4, shard4, 20), vec![0x30, 0x01]),
+                    (asset_out_point!(mint_tracker3, 0, asset_type3, shard3, 10), vec![0x30, 0x01])
+                ],
+            asset_transfer_outputs![
+                (lock_script_hash, vec![vec![1]], asset_type4, shard4, 20),
+                (lock_script_hash, vec![vec![1]], asset_type3, shard3, 10)
+            ]
+        );
+        let transfer_tracker = transfer.tracker().unwrap();
+        let transfer_tx = transaction!(seq: 0, fee: 11, transfer);
+
+        assert_eq!(
+            Ok(Invoice::Success),
+            state.apply(&transfer_tx, &H256::random(), &signer_public, &get_test_client())
+        );
+        check_top_level_state!(state, [
+            (account: sender => (seq: 1, balance: 25 - 11)),
+            (scheme: (shard3, asset_type3) => { supply: 10 }),
+            (scheme: (shard4, asset_type4) => { supply: 20 }),
+            (asset: (mint_tracker3, 0, shard3)),
+            (asset: (mint_tracker4, 0, shard4)),
+            (asset: (transfer_tracker, 0, shard3)),
+            (asset: (transfer_tracker, 1, shard3) => { asset_type: asset_type3, quantity: 10 }),
+            (asset: (transfer_tracker, 0, shard4) => { asset_type: asset_type4, quantity: 20 }),
+            (asset: (transfer_tracker, 1, shard4))
+        ]);
+    }
+
+    #[test]
+    fn multi_shard_transfer_failed_if_the_shard_id_of_input_is_not_valid() {
+        let shard3 = 3;
+        let shard4 = 4;
+
+        let mint_tracker3 = H256::random();
+        let mint_tracker4 = H256::random();
+        let asset_type3 = Blake::blake(mint_tracker3);
+        let asset_type4 = Blake::blake(mint_tracker4);
+        let lock_script_hash = H160::from("0xb042ad154a3359d276835c903587ebafefea22af");
+
+        let (sender, signer_public, _) = address();
+
+        let mut state = get_temp_state();
+        set_top_level_state!(state, [
+            (shard: 0 => owners: [address().0]),
+            (shard: 1 => owners: [address().0]),
+            (shard: 2 => owners: [address().0]),
+            (shard: shard3 => owners: [address().0]),
+            (shard: shard4 => owners: [address().0]),
+            (metadata: shards: 5),
+            (account: sender => balance: 25),
+            (scheme: (shard3, asset_type3) => { supply: 10, metadata: "asset on shard 3".to_string() }),
+            (scheme: (shard4, asset_type4) => { supply: 20, metadata: "asset on shard 4".to_string() }),
+            (asset: (shard3, mint_tracker3, 0) => { asset_type: asset_type3, quantity: 10, lock_script_hash: lock_script_hash }),
+            (asset: (shard4, mint_tracker4, 0) => { asset_type: asset_type4, quantity: 20, lock_script_hash: lock_script_hash })
+        ]);
+
+        let transfer = transfer_asset!(
+            inputs:
+                asset_transfer_inputs![
+                    (asset_out_point!(mint_tracker3, 0, asset_type3, shard3, 10), vec![0x30, 0x01]),
+                    (asset_out_point!(mint_tracker4, 0, asset_type4, shard3, 20), vec![0x30, 0x01])
+                ],
+            asset_transfer_outputs![
+                (lock_script_hash, vec![vec![1]], asset_type3, shard3, 10),
+                (lock_script_hash, vec![vec![1]], asset_type4, shard3, 20)
+            ]
+        );
+        let transfer_tracker = transfer.tracker().unwrap();
+        let transfer_tx = transaction!(seq: 0, fee: 11, transfer);
+
+        assert_eq!(
+            Ok(Invoice::Failure(
+                RuntimeError::AssetNotFound {
+                    shard_id: shard3,
+                    tracker: mint_tracker4,
+                    index: 0,
+                }
+                .to_string()
+            )),
+            state.apply(&transfer_tx, &H256::random(), &signer_public, &get_test_client())
+        );
+        check_top_level_state!(state, [
+            (account: sender => (seq: 1, balance: 25 - 11)),
+            (scheme: (shard3, asset_type3) => { supply: 10 }),
+            (scheme: (shard4, asset_type4) => { supply: 20 }),
+            (asset: (mint_tracker3, 0, shard3) => { asset_type: asset_type3, quantity: 10 }),
+            (asset: (mint_tracker4, 0, shard4) => { asset_type: asset_type4, quantity: 20 }),
+            (asset: (transfer_tracker, 0, shard3)),
+            (asset: (transfer_tracker, 1, shard3)),
+            (asset: (transfer_tracker, 0, shard4)),
+            (asset: (transfer_tracker, 1, shard4))
+        ]);
+    }
+
+    #[test]
+    fn multi_shard_transfer_failed_if_the_input_amount_is_not_valid() {
+        let shard3 = 3;
+        let shard4 = 4;
+
+        let mint_tracker3 = H256::random();
+        let mint_tracker4 = H256::random();
+        let asset_type3 = Blake::blake(mint_tracker3);
+        let asset_type4 = Blake::blake(mint_tracker4);
+        let lock_script_hash = H160::from("0xb042ad154a3359d276835c903587ebafefea22af");
+
+        let (sender, signer_public, _) = address();
+
+        let mut state = get_temp_state();
+        set_top_level_state!(state, [
+            (shard: 0 => owners: [address().0]),
+            (shard: 1 => owners: [address().0]),
+            (shard: 2 => owners: [address().0]),
+            (shard: shard3 => owners: [address().0]),
+            (shard: shard4 => owners: [address().0]),
+            (metadata: shards: 5),
+            (account: sender => balance: 25),
+            (scheme: (shard3, asset_type3) => { supply: 10, metadata: "asset on shard 3".to_string() }),
+            (scheme: (shard4, asset_type4) => { supply: 20, metadata: "asset on shard 4".to_string() }),
+            (asset: (shard3, mint_tracker3, 0) => { asset_type: asset_type3, quantity: 10, lock_script_hash: lock_script_hash }),
+            (asset: (shard4, mint_tracker4, 0) => { asset_type: asset_type4, quantity: 20, lock_script_hash: lock_script_hash })
+        ]);
+
+        let transfer = transfer_asset!(
+            inputs:
+                asset_transfer_inputs![
+                    (asset_out_point!(mint_tracker3, 0, asset_type3, shard3, 10), vec![0x30, 0x01]),
+                    (asset_out_point!(mint_tracker4, 0, asset_type4, shard4, 10), vec![0x30, 0x01])
+                ],
+            asset_transfer_outputs![
+                (lock_script_hash, vec![vec![1]], asset_type3, shard3, 10),
+                (lock_script_hash, vec![vec![1]], asset_type4, shard4, 10)
+            ]
+        );
+        let transfer_tracker = transfer.tracker().unwrap();
+        let transfer_tx = transaction!(seq: 0, fee: 11, transfer);
+
+        assert_eq!(
+            Ok(Invoice::Failure(
+                RuntimeError::InvalidAssetQuantity {
+                    shard_id: shard4,
+                    tracker: mint_tracker4,
+                    index: 0,
+                    expected: 20,
+                    got: 10,
+                }
+                .to_string()
+            )),
+            state.apply(&transfer_tx, &H256::random(), &signer_public, &get_test_client())
+        );
+        check_top_level_state!(state, [
+            (account: sender => (seq: 1, balance: 25 - 11)),
+            (scheme: (shard3, asset_type3) => { supply: 10 }),
+            (scheme: (shard4, asset_type4) => { supply: 20 }),
+            (asset: (transfer_tracker, 0, shard3)),
+            (asset: (transfer_tracker, 1, shard3)),
+            (asset: (transfer_tracker, 0, shard4)),
+            (asset: (transfer_tracker, 1, shard4)),
+            (asset: (mint_tracker3, 0, shard3) => { asset_type: asset_type3, quantity: 10 }),
+            (asset: (mint_tracker4, 0, shard4) => { asset_type: asset_type4, quantity: 20 })
         ]);
     }
 }
