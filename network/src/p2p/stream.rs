@@ -24,7 +24,6 @@ use rlp::{Decodable, DecoderError, Encodable, UntrustedRlp};
 use super::SignedMessage;
 use crate::session::Session;
 use crate::stream::{Error as StreamError, Stream};
-use crate::SocketAddr;
 
 #[derive(Debug)]
 pub enum Error {
@@ -93,19 +92,17 @@ impl SignedStream {
         }
     }
 
-    pub fn write<M>(&mut self, message: &M)
+    pub fn write<M>(&mut self, message: &M) -> Result<()>
     where
         M: Encodable, {
-        self.stream.write(&SignedMessage::new(message, &self.session));
+        let signed_message = SignedMessage::new(message, &self.session);
+        self.stream.write(&signed_message)?;
+        Ok(())
     }
 
     pub fn flush(&mut self) -> Result<()> {
         self.stream.flush()?;
         Ok(())
-    }
-
-    pub fn peer_addr(&self) -> Result<SocketAddr> {
-        Ok(self.stream.peer_addr()?)
     }
 
     pub fn session(&self) -> &Session {
