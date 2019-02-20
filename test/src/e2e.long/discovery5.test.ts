@@ -18,24 +18,31 @@ import { expect } from "chai";
 import "mocha";
 import CodeChain from "../helper/spawn";
 
-const describeSkippedInTravis = process.env.TRAVIS ? describe.skip : describe;
-
-describeSkippedInTravis("discovery5 nodes", function() {
-    const BASE = 100;
+describe("discovery5 nodes", function() {
     const numOfNodes = 5;
     let nodes: CodeChain[];
     let bootstrapNode: CodeChain;
 
     beforeEach(async function() {
-        nodes = [new CodeChain({ base: BASE })];
+        nodes = [new CodeChain()];
         bootstrapNode = nodes[0];
 
+        const startBootstrap = bootstrapNode.start([
+            "--discovery-refresh",
+            "50"
+        ]);
+
+        const nonBootstrapNodes = [];
         for (let i = 1; i < numOfNodes; i++) {
-            nodes.push(new CodeChain({ base: BASE }));
+            const node = new CodeChain();
+            nodes.push(node);
+            nonBootstrapNodes.push(node);
         }
 
+        await startBootstrap;
+
         await Promise.all(
-            nodes.map(node =>
+            nonBootstrapNodes.map(node =>
                 node.start([
                     "--bootstrap-addresses",
                     `127.0.0.1:${bootstrapNode.port}`,

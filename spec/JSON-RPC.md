@@ -752,6 +752,36 @@ Errors: `Invalid Params`
 
 [Back to **List of methods**](#list-of-methods)
 
+## chain_getErrorHint
+Gets a hint to find out why the transaction failed.
+
+### Params
+ 1. transaction hash - `H256`
+
+### Returns
+`null` | `string` - `null` if there is no hint, `string` if the transaction failed.
+
+Errors: `Invalid Params`
+
+### Request Example
+```
+  curl \                                                          
+    -H 'Content-Type: application/json' \
+    -d '{"jsonrpc": "2.0", "method": "chain_getErrorHint", "params": ["0x31de93320082d6d5f0026fca4fe513cb76197dd2ad99cb0802040801148ec717"], "id": null}' \
+    localhost:8080
+```
+
+### Response Example
+```
+{
+  "jsonrpc":"2.0",
+  "result":"Text verification has failed: Invalid Signature",
+  "id":null
+}
+```
+
+[Back to **List of methods**](#list-of-methods)
+
 ## chain_getTransactionByTracker
 Gets a transaction with the given tracker.
 
@@ -900,10 +930,10 @@ Errors: `KVDB Error`, `Invalid Params`
 [Back to **List of methods**](#list-of-methods)
 
 ## chain_getAsset
-Gets an asset with the given transaction hash and the index.
+Gets an asset with the given tracker of previous input transaction and the index.
 
 ### Params
- 1. transaction id - `H256`
+ 1. tracker - `H256`
  2. index - `number`
  3. shard id - `number`
  4. block number: `number` | `null`
