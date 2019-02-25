@@ -77,12 +77,10 @@ pub trait BlockInfo {
 }
 
 /// Provides various information on a transaction by it's ID
-pub trait ParcelInfo {
-    /// Get the hash of block that contains the parcel, if any.
-    fn transaction_block(&self, id: &TransactionId) -> Option<H256>;
-}
-
 pub trait TransactionInfo {
+    /// Get the hash of block that contains the transaction, if any.
+    fn transaction_block(&self, id: &TransactionId) -> Option<H256>;
+
     fn transaction_header(&self, hash: &H256) -> Option<::encoded::Header>;
 
     fn transaction_block_number(&self, hash: &H256) -> Option<BlockNumber> {
@@ -192,6 +190,9 @@ pub trait Shard {
 
     fn shard_id_by_hash(&self, create_shard_tx_hash: &H256, state: StateOrBlock) -> Option<ShardId>;
     fn shard_root(&self, shard_id: ShardId, state: StateOrBlock) -> Option<H256>;
+
+    fn shard_owners(&self, shard_id: ShardId, state: StateOrBlock) -> Option<Vec<Address>>;
+    fn shard_users(&self, shard_id: ShardId, state: StateOrBlock) -> Option<Vec<Address>>;
 }
 
 /// Provides a timer API for reseal_min_period/reseal_max_period on miner client
@@ -215,7 +216,7 @@ pub trait ImportBlock {
 }
 
 /// Provides various blockchain information, like block header, chain state etc.
-pub trait BlockChain: ChainInfo + BlockInfo + ParcelInfo + TransactionInfo {}
+pub trait BlockChain: ChainInfo + BlockInfo + TransactionInfo + TransactionInfo {}
 
 /// Blockchain database client. Owns and manages a blockchain and a block queue.
 pub trait BlockChainClient:
@@ -252,16 +253,16 @@ pub trait BlockChainClient:
     /// Get block hash.
     fn block_hash(&self, id: &BlockId) -> Option<H256>;
 
-    /// Get parcel with given hash.
-    fn parcel(&self, id: &TransactionId) -> Option<LocalizedTransaction>;
+    /// Get transaction with given hash.
+    fn transaction(&self, id: &TransactionId) -> Option<LocalizedTransaction>;
 
-    /// Get parcel invoice with given hash.
-    fn parcel_invoice(&self, id: &TransactionId) -> Option<Invoice>;
+    /// Get invoice with given hash.
+    fn invoice(&self, id: &TransactionId) -> Option<Invoice>;
 
     /// Get the transaction with given tracker.
-    fn transaction(&self, tracker: &H256) -> Option<LocalizedTransaction>;
+    fn transaction_by_tracker(&self, tracker: &H256) -> Option<LocalizedTransaction>;
 
-    fn transaction_invoices(&self, tracker: &H256) -> Vec<Invoice>;
+    fn invoices_by_tracker(&self, tracker: &H256) -> Vec<Invoice>;
 }
 
 /// Result of import block operation.
@@ -304,7 +305,7 @@ pub trait AssetClient {
 
     fn is_asset_spent(
         &self,
-        transaction_hash: H256,
+        tracker: H256,
         index: usize,
         shard_id: ShardId,
         block_id: BlockId,

@@ -16,16 +16,17 @@
 
 use std::sync::Arc;
 
-use ckey::{Address, Password, Public, SchnorrSignature};
+use ckey::{Address, Public, SchnorrSignature};
+use ckeystore::DecryptedAccount;
 use primitives::H256;
 
-use crate::account_provider::{AccountProvider, SignError};
+use crate::account_provider::{AccountProvider, Error as AccountProviderError};
 
 /// Everything that an Engine needs to sign messages.
 pub struct EngineSigner {
     account_provider: Arc<AccountProvider>,
     signer: Option<(Address, Public)>,
-    password: Option<Password>,
+    decrypted_account: Option<DecryptedAccount>,
 }
 
 impl Default for EngineSigner {
@@ -33,28 +34,47 @@ impl Default for EngineSigner {
         EngineSigner {
             account_provider: AccountProvider::transient_provider(),
             signer: Default::default(),
-            password: Default::default(),
+            decrypted_account: Default::default(),
         }
     }
 }
 
 impl EngineSigner {
     /// Set up the signer to sign with given address and password.
-    pub fn set(&mut self, ap: Arc<AccountProvider>, address: Address, password: Option<Password>) {
-        let public = ap.public(&address, password.clone()).expect("The address must be registered in AccountProvier");
+    pub fn set(&mut self, ap: Arc<AccountProvider>, address: Address) {
+        let public = {
+            let account = ap.get_unlocked_account(&address).expect("The address must be registered in AccountProvider");
+            account.public().expect("Cannot get public from account")
+        };
         self.account_provider = ap;
         self.signer = Some((address, public));
-        self.password = password;
+        self.decrypted_account = None;
         cdebug!(ENGINE, "Setting Engine signer to {}", address);
     }
 
+    // TODO: remove decrypted_account after some timeout
+    pub fn set_to_keep_decrypted_account(&mut self, ap: Arc<AccountProvider>, address: Address) {
+        let account =
+            ap.get_unlocked_account(&address).expect("The address must be registered in AccountProvider").disclose();
+        let public = account.public().expect("Cannot get public from account");
+
+        self.account_provider = ap;
+        self.signer = Some((address, public));
+        self.decrypted_account = Some(account);
+        cdebug!(ENGINE, "Setting Engine signer to {} (retaining)", address);
+    }
+
     /// Sign a consensus message hash.
-    pub fn sign(&self, hash: H256) -> Result<SchnorrSignature, SignError> {
-        self.account_provider.sign_schnorr(
-            self.signer.map(|(address, _public)| address).unwrap_or_else(Default::default),
-            self.password.clone(),
-            hash,
-        )
+    pub fn sign(&self, hash: H256) -> Result<SchnorrSignature, AccountProviderError> {
+        let address = self.signer.map(|(address, _public)| address).unwrap_or_else(Default::default);
+        let result = match &self.decrypted_account {
+            Some(account) => account.sign_schnorr(&hash)?,
+            None => {
+                let account = self.account_provider.get_unlocked_account(&address)?;
+                account.sign_schnorr(&hash)?
+            }
+        };
+        Ok(result)
     }
 
     /// Public Key of signer.

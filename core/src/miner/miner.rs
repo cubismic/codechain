@@ -34,7 +34,7 @@ use super::mem_pool_types::{AccountDetails, MemPoolInput, TxOrigin, TxTimelock};
 use super::sealing_queue::SealingQueue;
 use super::work_notify::{NotifyWork, WorkPoster};
 use super::{MinerService, MinerStatus, TransactionImportResult};
-use crate::account_provider::{AccountProvider, SignError};
+use crate::account_provider::{AccountProvider, Error as AccountProviderError};
 use crate::block::{Block, ClosedBlock, IsBlock};
 use crate::client::{
     AccountData, BlockChain, BlockProducer, ImportSealedBlock, MiningBlockChainClient, RegularKey, RegularKeyOwner,
@@ -602,24 +602,24 @@ impl MinerService for Miner {
         self.params.read().clone()
     }
 
-    fn set_author(&self, address: Address, password: Option<Password>) -> Result<(), SignError> {
+    fn set_author(&self, address: Address) -> Result<(), AccountProviderError> {
         self.params.write().author = address;
 
         if self.engine_type().need_signer_key() && self.engine.seals_internally().is_some() {
             if let Some(ref ap) = self.accounts {
                 ctrace!(MINER, "Set author to {:?}", address);
                 // Sign test message
-                ap.sign(address, password.clone(), Default::default())?;
+                ap.get_unlocked_account(&address)?.sign(&Default::default())?;
                 // Limit the scope of the locks.
                 {
                     let mut sealing_work = self.sealing_work.lock();
                     sealing_work.enabled = true;
                 }
-                self.engine.set_signer(ap.clone(), address, password);
+                self.engine.set_signer(ap.clone(), address);
                 Ok(())
             } else {
                 cwarn!(MINER, "No account provider");
-                Err(SignError::NotFound)
+                Err(AccountProviderError::NotFound)
             }
         } else {
             Ok(())
@@ -950,7 +950,7 @@ impl MinerService for Miner {
         };
         let tx = tx.complete(seq);
         let tx_hash = tx.hash();
-        let sig = account_provider.sign(address, passphrase, tx_hash)?;
+        let sig = account_provider.get_account(&address, passphrase.as_ref())?.sign(&tx_hash)?;
         let unverified = UnverifiedTransaction::new(tx, sig);
         let signed = SignedTransaction::try_new(unverified)?;
         let hash = signed.hash();

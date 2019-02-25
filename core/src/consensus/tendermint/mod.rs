@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Weak};
 
 use ccrypto::blake256;
-use ckey::{public_to_address, recover_schnorr, verify_schnorr, Address, Message, Password, Public, SchnorrSignature};
+use ckey::{public_to_address, recover_schnorr, verify_schnorr, Address, Message, SchnorrSignature};
 use cnetwork::{Api, NetworkExtension, NetworkService, NodeId};
 use cstate::ActionHandler;
 use ctimer::{TimeoutHandler, TimerToken};
@@ -1096,16 +1096,12 @@ impl TendermintInner {
         }
     }
 
-    fn set_signer(&mut self, ap: Arc<AccountProvider>, address: Address, password: Option<Password>) {
-        self.signer.set(ap, address, password);
+    fn set_signer(&mut self, ap: Arc<AccountProvider>, address: Address) {
+        self.signer.set_to_keep_decrypted_account(ap, address);
     }
 
     fn sign(&self, hash: H256) -> Result<SchnorrSignature, Error> {
         self.signer.sign(hash).map_err(Into::into)
-    }
-
-    fn signer_public(&self) -> Option<Public> {
-        self.signer.public().cloned()
     }
 
     fn signer_index(&self, bh: &H256) -> Option<usize> {
@@ -1248,19 +1244,9 @@ impl ConsensusEngine<CodeChainMachine> for Tendermint {
         guard.is_proposal(header)
     }
 
-    fn set_signer(&self, ap: Arc<AccountProvider>, address: Address, password: Option<Password>) {
+    fn set_signer(&self, ap: Arc<AccountProvider>, address: Address) {
         let mut guard = self.inner.lock();
-        guard.set_signer(ap, address, password)
-    }
-
-    fn sign(&self, hash: H256) -> Result<SchnorrSignature, Error> {
-        let guard = self.inner.lock();
-        guard.sign(hash)
-    }
-
-    fn signer_public(&self) -> Option<Public> {
-        let guard = self.inner.lock();
-        guard.signer_public()
+        guard.set_signer(ap, address)
     }
 
     fn register_network_extension_to_service(&self, service: &NetworkService) {
@@ -1702,10 +1688,11 @@ impl TendermintExtension {
     ) {
         ctrace!(
             ENGINE,
-            "Peer state update step: {:?} proposal {:?} known_votes {:?}",
+            "Peer state update step: {:?} proposal {:?} peer_lock_view {:?} known_votes {:?}",
             peer_vote_step,
             peer_proposal,
-            peer_known_votes
+            peer_lock_view,
+            peer_known_votes,
         );
         self.update_peer_state(token, peer_vote_step, peer_proposal, peer_known_votes);
 
@@ -1720,9 +1707,8 @@ impl TendermintExtension {
         } else {
             tendermint.vote_step()
         };
-        let current_step = current_vote_step.step;
 
-        if current_vote_step > peer_vote_step {
+        if tendermint.height > peer_vote_step.height {
             // no messages to receive
             return
         }
@@ -1743,14 +1729,19 @@ impl TendermintExtension {
             self.request_proposal(token, tendermint.height, tendermint.view);
         }
 
+        let current_step = current_vote_step.step;
         if current_step == Step::Prevote || current_step == Step::Precommit {
             let peer_known_votes = if current_vote_step == peer_vote_step {
                 peer_known_votes
-            } else {
+            } else if current_vote_step < peer_vote_step {
                 // We don't know which votes peer has.
                 // However the peer knows more than 2/3 of votes.
                 // So request all votes.
                 BitSet::all_set()
+            } else {
+                // If peer's state is less than my state,
+                // the peer does not know any useful votes.
+                BitSet::new()
             };
 
             let current_votes = tendermint.votes_received;
@@ -1762,7 +1753,13 @@ impl TendermintExtension {
 
         if peer_vote_step.height == tendermint.height {
             match (tendermint.last_lock, peer_lock_view) {
-                (None, Some(peer_lock_view)) => {
+                (None, Some(peer_lock_view)) if peer_lock_view < tendermint.view => {
+                    ctrace!(
+                        ENGINE,
+                        "Peer has a lock on {}-{} but I don't have it",
+                        peer_vote_step.height,
+                        peer_lock_view
+                    );
                     self.request_messages(
                         token,
                         VoteStep {
@@ -1776,6 +1773,13 @@ impl TendermintExtension {
                 (Some(my_lock_view), Some(peer_lock_view))
                     if my_lock_view < peer_lock_view && peer_lock_view < tendermint.view =>
                 {
+                    ctrace!(
+                        ENGINE,
+                        "Peer has a lock on {}-{} which is newer than mine {}",
+                        peer_vote_step.height,
+                        peer_lock_view,
+                        my_lock_view
+                    );
                     self.request_messages(
                         token,
                         VoteStep {
@@ -1962,7 +1966,7 @@ mod tests {
 
     fn insert_and_register(tap: &Arc<AccountProvider>, engine: &CodeChainEngine, acc: &str) -> Address {
         let addr = insert_and_unlock(tap, acc);
-        engine.set_signer(tap.clone(), addr, Some(acc.into()));
+        engine.set_signer(tap.clone(), addr);
         addr
     }
 
@@ -2012,7 +2016,7 @@ mod tests {
         header.set_parent_hash(Default::default());
 
         let vote_info = message_info_rlp(VoteStep::new(3, 0, Step::Precommit), Some(*header.parent_hash()));
-        let signature0 = tap.sign_schnorr(proposer, None, blake256(&vote_info)).unwrap();
+        let signature0 = tap.get_account(&proposer, None).unwrap().sign_schnorr(&blake256(&vote_info)).unwrap();
 
         let seal = Seal::Tendermint {
             prev_view: 0,
@@ -2031,9 +2035,9 @@ mod tests {
         }
 
         let voter = insert_and_unlock(&tap, "1");
-        let signature1 = tap.sign_schnorr(voter, None, blake256(&vote_info)).unwrap();
+        let signature1 = tap.get_account(&voter, None).unwrap().sign_schnorr(&blake256(&vote_info)).unwrap();
         let voter = insert_and_unlock(&tap, "2");
-        let signature2 = tap.sign_schnorr(voter, None, blake256(&vote_info)).unwrap();
+        let signature2 = tap.get_account(&voter, None).unwrap().sign_schnorr(&blake256(&vote_info)).unwrap();
 
         let seal = Seal::Tendermint {
             prev_view: 0,
@@ -2048,7 +2052,7 @@ mod tests {
         assert!(engine.verify_block_external(&header).is_ok());
 
         let bad_voter = insert_and_unlock(&tap, "101");
-        let bad_signature = tap.sign_schnorr(bad_voter, None, blake256(vote_info)).unwrap();
+        let bad_signature = tap.get_account(&bad_voter, None).unwrap().sign_schnorr(&blake256(vote_info)).unwrap();
 
         let seal = Seal::Tendermint {
             prev_view: 0,

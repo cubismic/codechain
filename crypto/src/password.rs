@@ -1,4 +1,4 @@
-// Copyright 2018 Kodebox, Inc.
+// Copyright 2019 Kodebox, Inc.
 // This file is part of CodeChain.
 //
 // This program is free software: you can redistribute it and/or modify
@@ -14,18 +14,14 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-mod block_info;
-#[cfg_attr(feature = "cargo-clippy", allow(clippy::module_inception))]
-mod blockchain;
-mod body_db;
-mod extras;
-mod headerchain;
-mod invoice_db;
-mod route;
+use std::ops::Deref;
 
-pub use self::blockchain::{BlockChain, BlockProvider};
-pub use self::body_db::BodyProvider;
-pub use self::extras::{BlockDetails, TransactionAddress, TransactionAddresses};
-pub use self::headerchain::HeaderProvider;
-pub use self::invoice_db::InvoiceProvider;
-pub use self::route::ImportRoute;
+pub struct Password<'a>(pub &'a str);
+
+impl<'a> Deref for Password<'a> {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}

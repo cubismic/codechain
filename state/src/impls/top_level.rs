@@ -156,11 +156,14 @@ impl StateWithCache for TopLevelState {
         let shard_changes = shard_ids
             .into_iter()
             .map(|shard_id| {
-                let shard_root = self.shard_root(shard_id)?.expect("Shard must exist");
-                Ok((shard_id, shard_root))
+                if let Some(shard_root) = self.shard_root(shard_id)? {
+                    Ok(Some((shard_id, shard_root)))
+                } else {
+                    Ok(None)
+                }
             })
             .collect::<StateResult<Vec<_>>>()?;
-        for (shard_id, mut shard_root) in shard_changes.into_iter() {
+        for (shard_id, mut shard_root) in shard_changes.into_iter().filter_map(|result| result) {
             {
                 let mut db = self.db.borrow_mut();
                 let mut trie = TrieFactory::from_existing(db.as_hashdb_mut(), &mut shard_root)?;
@@ -346,13 +349,48 @@ impl TopLevelState {
         match action {
             Action::MintAsset {
                 approvals,
+                approver,
+                administrator,
                 ..
             }
             | Action::ChangeAssetScheme {
                 approvals,
+                approver,
+                administrator,
                 ..
+            } => {
+                if let Some(approver) = approver {
+                    if !is_active_account(self, approver)? {
+                        return Err(RuntimeError::NonActiveAccount {
+                            address: *approver,
+                            name: "approver of asset".to_string(),
+                        }
+                        .into())
+                    }
+                }
+                if let Some(administrator) = administrator {
+                    if !is_active_account(self, administrator)? {
+                        return Err(RuntimeError::NonActiveAccount {
+                            address: *administrator,
+                            name: "administrator of asset".to_string(),
+                        }
+                        .into())
+                    }
+                }
+                let transaction = Option::<ShardTransaction>::from(action.clone()).expect("It's a shard transaction");
+                let transaction_tracker = transaction.tracker();
+                let approvers = approvals
+                    .iter()
+                    .map(|signature| {
+                        let public = recover(&signature, &transaction_tracker)?;
+                        self.public_to_owner_address(&public)
+                    })
+                    .collect::<StateResult<Vec<_>>>()?;
+                let shard_ids = transaction.related_shards();
+                assert_eq!(1, shard_ids.len());
+                Ok(self.apply_shard_transaction_to_shard(&transaction, shard_ids[0], fee_payer, &approvers, client)?)
             }
-            | Action::IncreaseAssetSupply {
+            Action::IncreaseAssetSupply {
                 approvals,
                 ..
             } => {
@@ -427,8 +465,10 @@ impl TopLevelState {
                 self.set_regular_key(signer_public, key)?;
                 Ok(Invoice::Success)
             }
-            Action::CreateShard => {
-                self.create_shard(fee_payer, *signed_hash)?;
+            Action::CreateShard {
+                users,
+            } => {
+                self.create_shard(fee_payer, *signed_hash, users.clone())?;
                 Ok(Invoice::Success)
             }
             Action::SetShardOwners {
@@ -663,6 +703,12 @@ impl TopLevelState {
         self.get_account_mut(a)?.set_balance(balance);
         Ok(())
     }
+    #[cfg(test)]
+    fn set_seq(&mut self, a: &Address, seq: u64) -> TrieResult<()> {
+        self.get_account_mut(a)?.set_seq(seq);
+        Ok(())
+    }
+
 
     #[cfg(test)]
     fn set_number_of_shards(&mut self, number_of_shards: ShardId) -> TrieResult<()> {
@@ -820,12 +866,12 @@ impl TopState for TopLevelState {
         Ok(())
     }
 
-    fn create_shard(&mut self, fee_payer: &Address, tx_hash: H256) -> StateResult<()> {
+    fn create_shard(&mut self, fee_payer: &Address, tx_hash: H256, users: Vec<Address>) -> StateResult<()> {
         let shard_id = {
             let mut metadata = self.get_metadata_mut()?;
             metadata.add_shard(tx_hash)
         };
-        self.create_shard_level_state(shard_id, vec![*fee_payer], vec![])?;
+        self.create_shard_level_state(shard_id, vec![*fee_payer], users)?;
 
         Ok(())
     }
@@ -858,12 +904,30 @@ impl TopState for TopLevelState {
     }
 
     fn set_shard_owners(&mut self, shard_id: ShardId, new_owners: Vec<Address>) -> StateResult<()> {
+        for owner in &new_owners {
+            if !is_active_account(self, owner)? {
+                return Err(RuntimeError::NonActiveAccount {
+                    name: "shard owner".to_string(),
+                    address: *owner,
+                }
+                .into())
+            }
+        }
         let mut shard = self.get_shard_mut(shard_id)?;
         shard.set_owners(new_owners);
         Ok(())
     }
 
     fn set_shard_users(&mut self, shard_id: ShardId, new_users: Vec<Address>) -> StateResult<()> {
+        for user in &new_users {
+            if !is_active_account(self, user)? {
+                return Err(RuntimeError::NonActiveAccount {
+                    name: "shard user".to_string(),
+                    address: *user,
+                }
+                .into())
+            }
+        }
         let mut shard = self.get_shard_mut(shard_id)?;
         shard.set_users(new_users);
         Ok(())
@@ -899,6 +963,13 @@ impl TopState for TopLevelState {
         let mut action_data = self.get_action_data_mut(key)?;
         *action_data = data.into();
         Ok(())
+    }
+}
+
+fn is_active_account(state: &TopStateView, address: &Address) -> TrieResult<bool> {
+    match &state.account(address)? {
+        Some(account) if account.is_active() => Ok(true),
+        _ => Ok(false),
     }
 }
 
@@ -1361,7 +1432,7 @@ mod tests_tx {
             (account: sender => (seq: 1, balance: 10, key: *key))
         ]);
 
-        let tx = transaction!(seq: 1, fee: 5, Action::CreateShard);
+        let tx = transaction!(seq: 1, fee: 5, Action::CreateShard { users: vec![] });
 
         assert_eq!(
             Ok(Invoice::Success),
@@ -1370,7 +1441,7 @@ mod tests_tx {
 
         check_top_level_state!(state, [
             (account: sender => (seq: 2, balance: 15 - 5 - 5)),
-            (shard: 0 => owners: [sender])
+            (shard: 0 => owners: vec![sender], users: vec![])
         ]);
     }
 
@@ -1468,9 +1539,9 @@ mod tests_tx {
         let asset_type = Blake::blake(mint_tracker);
 
         set_top_level_state!(state, [
+            (account: sender => balance: 25),
             (shard: shard_id => owners: [sender]),
             (metadata: shards: 1),
-            (account: sender => balance: 25),
             (regular_key: sender_public => regular_public),
             (scheme: (shard_id, asset_type) => { supply: amount, metadata: metadata, approver: Some(sender) }),
             (asset: (shard_id, mint_tracker, 0) => { asset_type: asset_type, quantity: amount, lock_script_hash: lock_script_hash })
@@ -1507,9 +1578,9 @@ mod tests_tx {
         let asset_type = Blake::blake(mint_tracker);
 
         set_top_level_state!(state, [
+            (account: sender => balance: 25),
             (shard: shard_id => owners: [sender]),
             (metadata: shards: 1),
-            (account: sender => balance: 25),
             (regular_key: sender_public => regular_public),
             (scheme: (shard_id, asset_type) => { supply: amount, metadata: metadata, approver: Some(sender) }),
             (asset: (shard_id, mint_tracker, 0) => { asset_type: asset_type, quantity: amount, lock_script_hash: lock_script_hash })
@@ -1552,12 +1623,12 @@ mod tests_tx {
 
         assert_eq!(Ok(false), state.regular_account_exists_and_not_null(&regular_public));
 
-        let tx = transaction!(fee: 5, Action::CreateShard);
+        let tx = transaction!(fee: 5, Action::CreateShard { users: vec![] });
         assert_eq!(Ok(Invoice::Success), state.apply(&tx, &H256::random(), &regular_public, &get_test_client()));
         check_top_level_state!(state, [
             (account: sender => (seq: 0, balance: 20)),
             (account: regular_address => (seq: 1, balance: 20 - 5)),
-            (shard: 0 => owners: [regular_address])
+            (shard: 0 => owners: vec![regular_address], users: vec![])
         ]);
     }
 
@@ -1645,16 +1716,17 @@ mod tests_tx {
         let shard_id = 0x0;
 
         let mut state = get_temp_state();
+        let approver = Address::random();
         set_top_level_state!(state, [
+            (account: sender => balance: 100),
+            (account: approver => seq: 1),
             (shard: shard_id => owners: [sender]),
-            (metadata: shards: 1),
-            (account: sender => balance: 100)
+            (metadata: shards: 1)
         ]);
 
         let metadata = "metadata".to_string();
         let lock_script_hash = H160::random();
         let parameters = vec![];
-        let approver = Address::random();
         let amount = 30;
         let transaction = mint_asset!(
             Box::new(asset_mint_output!(lock_script_hash, parameters.clone(), amount)),
@@ -1681,16 +1753,17 @@ mod tests_tx {
         let shard_id = 0;
 
         let mut state = get_temp_state();
+        let approver = Address::random();
         set_top_level_state!(state, [
+            (account: sender => balance: 100),
+            (account: approver => seq: 1),
             (shard: shard_id => owners: [sender]),
-            (metadata: shards: 1),
-            (account: sender => balance: 100)
+            (metadata: shards: 1)
         ]);
 
         let metadata = "metadata".to_string();
         let lock_script_hash = H160::random();
         let parameters = vec![];
-        let approver = Address::random();
         let transaction = mint_asset!(
             Box::new(asset_mint_output!(lock_script_hash, parameters: parameters.clone())),
             metadata.clone(),
@@ -1717,9 +1790,9 @@ mod tests_tx {
 
         let mut state = get_temp_state();
         set_top_level_state!(state, [
+            (account: sender => balance: 120),
             (shard: shard_id => owners: [sender]),
-            (metadata: shards: 1),
-            (account: sender => balance: 120)
+            (metadata: shards: 1)
         ]);
 
         let metadata = "metadata".to_string();
@@ -1775,16 +1848,17 @@ mod tests_tx {
         let shard_id = 0x0;
 
         let mut state = get_temp_state();
+        let approver = Address::random();
         set_top_level_state!(state, [
+            (account: sender => balance: 100),
+            (account: approver => seq: 1),
             (shard: shard_id => owners: [sender]),
-            (metadata: shards: 1),
-            (account: sender => balance: 100)
+            (metadata: shards: 1)
         ]);
 
         let metadata = "metadata".to_string();
         let lock_script_hash = H160::random();
         let parameters = vec![];
-        let approver = Address::random();
         let amount = 30;
         let transaction = mint_asset!(
             Box::new(asset_mint_output!(lock_script_hash, parameters.clone(), amount)),
@@ -1825,9 +1899,9 @@ mod tests_tx {
 
         let mut state = get_temp_state();
         set_top_level_state!(state, [
+            (account: sender => balance: 100),
             (shard: shard_id => owners: [sender]),
-            (metadata: shards: 1),
-            (account: sender => balance: 100)
+            (metadata: shards: 1)
         ]);
 
         let lock_script_hash = H160::from("ca5d3fa0a6887285ef6aa85cb12960a2b6706e00");
@@ -1864,9 +1938,9 @@ mod tests_tx {
 
         let mut state = get_temp_state();
         set_top_level_state!(state, [
+            (account: sender => balance: 100),
             (shard: shard_id => owners: [sender]),
-            (metadata: shards: 1),
-            (account: sender => balance: 100)
+            (metadata: shards: 1)
         ]);
 
         let lock_script_hash = H160::from("ca5d3fa0a6887285ef6aa85cb12960a2b6706e00");
@@ -1914,9 +1988,9 @@ mod tests_tx {
 
         let mut state = get_temp_state();
         set_top_level_state!(state, [
+            (account: sender => balance: 20),
             (shard: shard_id => owners: [sender]),
-            (metadata: shards: 1),
-            (account: sender => balance: 20)
+            (metadata: shards: 1)
         ]);
 
         let lock_script_hash = H160::from("ca5d3fa0a6887285ef6aa85cb12960a2b6706e00");
@@ -1950,9 +2024,9 @@ mod tests_tx {
 
         let mut state = get_temp_state();
         set_top_level_state!(state, [
+            (account: sender => balance: 100),
             (shard: shard_id => owners: [sender]),
-            (metadata: shards: 1),
-            (account: sender => balance: 100)
+            (metadata: shards: 1)
         ]);
 
         let lock_script_hash = H160::from("b042ad154a3359d276835c903587ebafefea22af");
@@ -2014,9 +2088,9 @@ mod tests_tx {
 
         let mut state = get_temp_state();
         set_top_level_state!(state, [
+            (account: sender => balance: 20),
             (shard: shard_id => owners: [sender]),
-            (metadata: shards: 1),
-            (account: sender => balance: 20)
+            (metadata: shards: 1)
         ]);
 
         let content = "CodeChain".to_string();
@@ -2054,9 +2128,9 @@ mod tests_tx {
 
         let mut state = get_temp_state();
         set_top_level_state!(state, [
+            (account: sender => balance: 20),
             (shard: shard_id => owners: [sender]),
-            (metadata: shards: 1),
-            (account: sender => balance: 20)
+            (metadata: shards: 1)
         ]);
 
         let content = "CodeChain".to_string();
@@ -2099,9 +2173,9 @@ mod tests_tx {
 
         let mut state = get_temp_state();
         set_top_level_state!(state, [
+            (account: sender => balance: 20),
             (shard: shard_id => owners: [sender]),
-            (metadata: shards: 1),
-            (account: sender => balance: 20)
+            (metadata: shards: 1)
         ]);
 
         let hash = H256::random();
@@ -2146,15 +2220,20 @@ mod tests_tx {
     }
 
     #[test]
+    #[allow(clippy::cyclomatic_complexity)]
     fn apply_create_shard() {
         let mut state = get_temp_state();
         let (sender, sender_public, _) = address();
+        let users = vec![Address::random(), Address::random(), Address::random()];
         set_top_level_state!(state, [
+            (account: users[0] => seq: 1),
+            (account: users[1] => seq: 1),
+            (account: users[2] => seq: 1),
             (account: sender => balance: 20)
         ]);
 
-        let tx1 = transaction!(fee: 5, Action::CreateShard);
-        let tx2 = transaction!(seq: 1, fee: 5, Action::CreateShard);
+        let tx1 = transaction!(fee: 5, Action::CreateShard { users: vec![] });
+        let tx2 = transaction!(seq: 1, fee: 5, Action::CreateShard { users: users.clone() });
         let invalid_hash = H256::random();
         let signed_hash1 = H256::random();
         let signed_hash2 = H256::random();
@@ -2182,8 +2261,8 @@ mod tests_tx {
 
         check_top_level_state!(state, [
             (account: sender => (seq: 2, balance: 20 - 5 - 5)),
-            (shard: 0 => owners: [sender]),
-            (shard: 1 => owners: [sender]),
+            (shard: 0 => owners: vec![sender], users: vec![]),
+            (shard: 1 => owners: vec![sender], users: users),
             (shard: 2)
         ]);
     }
@@ -2195,16 +2274,19 @@ mod tests_tx {
         let (sender, sender_public, _) = address();
         let shard_owner0 = address().0;
         let shard_owner1 = address().0;
+        let shard_user = Address::random();
 
         set_top_level_state!(state, [
+            (account: shard_owner0 => seq: 1),
+            (account: shard_owner1 => seq: 1),
+            (account: shard_user => seq: 1),
             (shard: 0 => owners: [shard_owner0]),
             (shard: 1 => owners: [shard_owner1]),
             (metadata: shards: 2),
             (account: sender => balance: 20)
         ]);
 
-        let tx1 = transaction!(fee: 5, Action::CreateShard);
-        let tx2 = transaction!(seq: 1, fee: 5, Action::CreateShard);
+        let tx1 = transaction!(fee: 5, Action::CreateShard { users: vec![shard_user] });
         let invalid_hash = H256::random();
         let signed_hash1 = H256::random();
         let signed_hash2 = H256::random();
@@ -2222,11 +2304,12 @@ mod tests_tx {
         check_top_level_state!(state, [
             (account: sender => (seq: 1, balance: 20 - 5)),
             (shard: 0 => owners: [shard_owner0]),
-            (shard: 1 => owners: [shard_owner1]),
-            (shard: 2 => owners: [sender]),
+            (shard: 1 => owners: vec![shard_owner1]),
+            (shard: 2 => owners: vec![sender], users: vec![shard_user]),
             (shard: 3)
         ]);
 
+        let tx2 = transaction!(seq: 1, fee: 5, Action::CreateShard { users: vec![] });
         assert_eq!(Ok(Invoice::Success), state.apply(&tx2, &signed_hash2, &sender_public, &get_test_client()));
         assert_eq!(Ok(None), state.shard_id_by_hash(&invalid_hash));
         assert_eq!(Ok(Some(2)), state.shard_id_by_hash(&signed_hash1));
@@ -2236,8 +2319,8 @@ mod tests_tx {
             (account: sender => (seq: 2, balance: 20 - 5 - 5)),
             (shard: 0 => owners: [shard_owner0]),
             (shard: 1 => owners: [shard_owner1]),
-            (shard: 2 => owners: [sender]),
-            (shard: 3 => owners: [sender]),
+            (shard: 2 => owners: vec![sender], users: vec![shard_user]),
+            (shard: 3 => owners: vec![sender], users: vec![]),
             (shard: 4)
         ]);
     }
@@ -2250,13 +2333,13 @@ mod tests_tx {
             (account: sender => balance: 20)
         ]);
 
-        let tx = transaction!(fee: 5, Action::CreateShard);
+        let tx = transaction!(fee: 5, Action::CreateShard { users: vec![] });
         assert_eq!(Ok(Invoice::Success), state.apply(&tx, &H256::random(), &sender_public, &get_test_client()));
 
         let invalid_shard_id = 3;
         check_top_level_state!(state, [
             (account: sender => (seq: 1, balance: 20 - 5)),
-            (shard: 0 => owners: [sender]),
+            (shard: 0 => owners: vec![sender], users: vec![]),
             (asset: (H256::random(), 0, invalid_shard_id))
         ]);
     }
@@ -2265,17 +2348,20 @@ mod tests_tx {
     fn get_asset_scheme_in_invalid_shard2() {
         let mut state = get_temp_state();
         let (sender, sender_public, _) = address();
+        let users = vec![Address::random(), Address::random()];
         set_top_level_state!(state, [
+            (account: users[0] => seq: 1),
+            (account: users[1] => seq: 1),
             (account: sender => balance: 20)
         ]);
 
-        let tx = transaction!(fee: 5, Action::CreateShard);
+        let tx = transaction!(fee: 5, Action::CreateShard { users: users.clone() });
         assert_eq!(Ok(Invoice::Success), state.apply(&tx, &H256::random(), &sender_public, &get_test_client()));
 
         let invalid_shard_id = 3;
         check_top_level_state!(state, [
             (account: sender => (seq: 1, balance: 20 - 5)),
-            (shard: 0 => owners: [sender]),
+            (shard: 0 => owners: vec![sender], users: users),
             (asset: (H256::random(), 0, invalid_shard_id))
         ]);
     }
@@ -2284,14 +2370,15 @@ mod tests_tx {
     fn mint_asset_on_invalid_shard_must_fail() {
         let mut state = get_temp_state();
         let (sender, sender_public, _) = address();
+        let approver = Address::random();
         set_top_level_state!(state, [
+            (account: approver => seq: 1),
             (account: sender => balance: 100)
         ]);
 
         let metadata = "metadata".to_string();
         let lock_script_hash = H160::random();
         let parameters = vec![];
-        let approver = Address::random();
         let amount = 30;
         let transaction = mint_asset!(
             Box::new(asset_mint_output!(lock_script_hash, parameters.clone(), amount)),
@@ -2353,13 +2440,14 @@ mod tests_tx {
         let shard_id = 0;
 
         let mut state = get_temp_state();
-        set_top_level_state!(state, [
-            (shard: shard_id => owners: [sender]),
-            (metadata: shards: 1),
-            (account: sender => balance: 100)
-        ]);
-
         let owners = vec![Address::random(), Address::random(), sender];
+        set_top_level_state!(state, [
+            (account: sender => balance: 100),
+            (account: owners[0] => balance: 100),
+            (account: owners[1] => balance: 100),
+            (shard: shard_id => owners: [sender]),
+            (metadata: shards: 1)
+        ]);
 
         let tx = transaction!(fee: 5, set_shard_owners!(owners.clone()));
         assert_eq!(Ok(Invoice::Success), state.apply(&tx, &H256::random(), &sender_public, &get_test_client()));
@@ -2377,13 +2465,15 @@ mod tests_tx {
         let shard_id = 0;
 
         let mut state = get_temp_state();
+        let owners = vec![Address::random(), Address::random()];
         set_top_level_state!(state, [
+            (account: sender => balance: 100),
+            (account: owners[0] => seq: 1),
+            (account: owners[0] => seq: 1),
             (shard: shard_id => owners: [sender]),
-            (metadata: shards: 1),
-            (account: sender => balance: 100)
+            (metadata: shards: 1)
         ]);
 
-        let owners = vec![Address::random(), Address::random()];
         let tx = transaction!(fee: 5, set_shard_owners!(owners));
         assert_eq!(
             Ok(Invoice::Failure(RuntimeError::NewOwnersMustContainSender.to_string())),
@@ -2404,9 +2494,10 @@ mod tests_tx {
         let mut state = get_temp_state();
         let (sender, sender_public, _) = address();
         set_top_level_state!(state, [
+            (account: sender => balance: 100),
+            (account: original_owner => seq: 1),
             (shard: shard_id => owners: [original_owner]),
-            (metadata: shards: 1),
-            (account: sender => balance: 100)
+            (metadata: shards: 1)
         ]);
 
         let owners = vec![Address::random(), Address::random(), sender];
@@ -2430,9 +2521,9 @@ mod tests_tx {
 
         let mut state = get_temp_state();
         set_top_level_state!(state, [
+            (account: sender => balance: 100),
             (shard: shard_id => owners: [sender]),
-            (metadata: shards: 1),
-            (account: sender => balance: 100)
+            (metadata: shards: 1)
         ]);
 
         let invalid_shard_id = 0xF;
@@ -2459,9 +2550,10 @@ mod tests_tx {
 
         let mut state = get_temp_state();
         set_top_level_state!(state, [
+            (account: sender => balance: 100),
+            (account: original_owner => seq: 1),
             (shard: shard_id => owners: [original_owner], users: [sender]),
-            (metadata: shards: 1),
-            (account: sender => balance: 100)
+            (metadata: shards: 1)
         ]);
 
         let owners = vec![Address::random(), Address::random(), sender];
@@ -2487,9 +2579,10 @@ mod tests_tx {
 
         let mut state = get_temp_state();
         set_top_level_state!(state, [
+            (account: sender => balance: 100),
+            (account: original_owner => seq: 1),
             (shard: shard_id => owners: [original_owner], users: [sender]),
-            (metadata: shards: 1),
-            (account: sender => balance: 100)
+            (metadata: shards: 1)
         ]);
 
         let metadata = "metadata".to_string();
@@ -2520,13 +2613,18 @@ mod tests_tx {
         let shard_id = 0;
 
         let mut state = get_temp_state();
+        let new_users = vec![Address::random(), Address::random(), sender];
         set_top_level_state!(state, [
+            (account: sender => balance: 100),
+            (account: old_users[0] => seq: 1),
+            (account: old_users[1] => seq: 1),
+            (account: old_users[2] => seq: 1),
+            (account: new_users[0] => seq: 1),
+            (account: new_users[1] => seq: 1),
             (shard: shard_id => owners: [sender], users: old_users),
-            (metadata: shards: 1),
-            (account: sender => balance: 100)
+            (metadata: shards: 1)
         ]);
 
-        let new_users = vec![Address::random(), Address::random(), sender];
         let tx = transaction!(fee: 5, set_shard_users!(new_users.clone()));
 
         assert_eq!(Ok(Invoice::Success), state.apply(&tx, &H256::random(), &sender_public, &get_test_client()));
@@ -2545,9 +2643,15 @@ mod tests_tx {
 
         let mut state = get_temp_state();
         set_top_level_state!(state, [
+            (account: sender => balance: 100),
+            (account: old_users[0] => seq: 1),
+            (account: old_users[1] => seq: 1),
+            (account: old_users[2] => seq: 1),
+            (account: owners[0] => seq: 1),
+            (account: owners[1] => seq: 1),
+            (account: owners[2] => seq: 1),
             (shard: shard_id => owners: owners.clone(), users: old_users.clone()),
-            (metadata: shards: 1),
-            (account: sender => balance: 100)
+            (metadata: shards: 1)
         ]);
 
         let new_users = vec![Address::random(), Address::random(), sender];
@@ -2577,10 +2681,12 @@ mod tests_tx {
         let (sender, signer_public, _) = address();
 
         let mut state = get_temp_state();
+        let owner0 = address().0;
         set_top_level_state!(state, [
-            (shard: shard_id => owners: [address().0]),
-            (metadata: shards: 1),
             (account: sender => balance: 25),
+            (account: owner0 => seq: 1),
+            (shard: shard_id => owners: [owner0]),
+            (metadata: shards: 1),
             (scheme: (shard_id, asset_type1) => { supply: 10, metadata: format!("asset on shard {}", shard_id) }),
             (scheme: (shard_id, asset_type2) => { supply: 20, metadata: format!("asset on shard {}", shard_id) }),
             (asset: (shard_id, mint_tracker1, 0) => { asset_type: asset_type1, quantity: 10, lock_script_hash: lock_script_hash }),
@@ -2626,6 +2732,7 @@ mod tests_tx {
     }
 
     #[test]
+    #[allow(clippy::cyclomatic_complexity)]
     fn multi_shard_transfer() {
         let shard3 = 3;
         let shard4 = 4;
@@ -2639,14 +2746,24 @@ mod tests_tx {
         let (sender, signer_public, _) = address();
 
         let mut state = get_temp_state();
+        let owner0 = address().0;
+        let owner1 = address().0;
+        let owner2 = address().0;
+        let owner3 = address().0;
+        let owner4 = address().0;
         set_top_level_state!(state, [
-            (shard: 0 => owners: [address().0]),
-            (shard: 1 => owners: [address().0]),
-            (shard: 2 => owners: [address().0]),
-            (shard: shard3 => owners: [address().0]),
-            (shard: shard4 => owners: [address().0]),
-            (metadata: shards: 5),
             (account: sender => balance: 25),
+            (account: owner0 => seq: 1),
+            (account: owner1 => seq: 1),
+            (account: owner2 => seq: 1),
+            (account: owner3 => seq: 1),
+            (account: owner4 => seq: 1),
+            (shard: 0 => owners: [owner0]),
+            (shard: 1 => owners: [owner1]),
+            (shard: 2 => owners: [owner2]),
+            (shard: shard3 => owners: [owner3]),
+            (shard: shard4 => owners: [owner4]),
+            (metadata: shards: 5),
             (scheme: (shard3, asset_type3) => { supply: 10, metadata: "asset on shard 3".to_string() }),
             (scheme: (shard4, asset_type4) => { supply: 20, metadata: "asset on shard 4".to_string() }),
             (asset: (shard3, mint_tracker3, 0) => { asset_type: asset_type3, quantity: 10, lock_script_hash: lock_script_hash }),
@@ -2685,6 +2802,7 @@ mod tests_tx {
     }
 
     #[test]
+    #[allow(clippy::cyclomatic_complexity)]
     fn multi_shard_transfer_in_cross_order() {
         let shard3 = 3;
         let shard4 = 4;
@@ -2698,14 +2816,24 @@ mod tests_tx {
         let (sender, signer_public, _) = address();
 
         let mut state = get_temp_state();
+        let owner0 = address().0;
+        let owner1 = address().0;
+        let owner2 = address().0;
+        let owner3 = address().0;
+        let owner4 = address().0;
         set_top_level_state!(state, [
-            (shard: 0 => owners: [address().0]),
-            (shard: 1 => owners: [address().0]),
-            (shard: 2 => owners: [address().0]),
-            (shard: shard3 => owners: [address().0]),
-            (shard: shard4 => owners: [address().0]),
-            (metadata: shards: 5),
             (account: sender => balance: 25),
+            (account: owner0 => seq: 1),
+            (account: owner1 => seq: 1),
+            (account: owner2 => seq: 1),
+            (account: owner3 => seq: 1),
+            (account: owner4 => seq: 1),
+            (shard: 0 => owners: [owner0]),
+            (shard: 1 => owners: [owner1]),
+            (shard: 2 => owners: [owner2]),
+            (shard: shard3 => owners: [owner3]),
+            (shard: shard4 => owners: [owner4]),
+            (metadata: shards: 5),
             (scheme: (shard3, asset_type3) => { supply: 10, metadata: "asset on shard 3".to_string() }),
             (scheme: (shard4, asset_type4) => { supply: 20, metadata: "asset on shard 4".to_string() }),
             (asset: (shard3, mint_tracker3, 0) => { asset_type: asset_type3, quantity: 10, lock_script_hash: lock_script_hash }),
@@ -2744,6 +2872,7 @@ mod tests_tx {
     }
 
     #[test]
+    #[allow(clippy::cyclomatic_complexity)]
     fn multi_shard_transfer_failed_if_the_shard_id_of_input_is_not_valid() {
         let shard3 = 3;
         let shard4 = 4;
@@ -2757,14 +2886,24 @@ mod tests_tx {
         let (sender, signer_public, _) = address();
 
         let mut state = get_temp_state();
+        let owner0 = address().0;
+        let owner1 = address().0;
+        let owner2 = address().0;
+        let owner3 = address().0;
+        let owner4 = address().0;
         set_top_level_state!(state, [
-            (shard: 0 => owners: [address().0]),
-            (shard: 1 => owners: [address().0]),
-            (shard: 2 => owners: [address().0]),
-            (shard: shard3 => owners: [address().0]),
-            (shard: shard4 => owners: [address().0]),
-            (metadata: shards: 5),
             (account: sender => balance: 25),
+            (account: owner0 => seq: 1),
+            (account: owner1 => seq: 1),
+            (account: owner2 => seq: 1),
+            (account: owner3 => seq: 1),
+            (account: owner4 => seq: 1),
+            (shard: 0 => owners: [owner0]),
+            (shard: 1 => owners: [owner1]),
+            (shard: 2 => owners: [owner2]),
+            (shard: shard3 => owners: [owner3]),
+            (shard: shard4 => owners: [owner4]),
+            (metadata: shards: 5),
             (scheme: (shard3, asset_type3) => { supply: 10, metadata: "asset on shard 3".to_string() }),
             (scheme: (shard4, asset_type4) => { supply: 20, metadata: "asset on shard 4".to_string() }),
             (asset: (shard3, mint_tracker3, 0) => { asset_type: asset_type3, quantity: 10, lock_script_hash: lock_script_hash }),
@@ -2810,6 +2949,7 @@ mod tests_tx {
     }
 
     #[test]
+    #[allow(clippy::cyclomatic_complexity)]
     fn multi_shard_transfer_failed_if_the_input_amount_is_not_valid() {
         let shard3 = 3;
         let shard4 = 4;
@@ -2823,14 +2963,24 @@ mod tests_tx {
         let (sender, signer_public, _) = address();
 
         let mut state = get_temp_state();
+        let owner0 = address().0;
+        let owner1 = address().0;
+        let owner2 = address().0;
+        let owner3 = address().0;
+        let owner4 = address().0;
         set_top_level_state!(state, [
-            (shard: 0 => owners: [address().0]),
-            (shard: 1 => owners: [address().0]),
-            (shard: 2 => owners: [address().0]),
-            (shard: shard3 => owners: [address().0]),
-            (shard: shard4 => owners: [address().0]),
-            (metadata: shards: 5),
             (account: sender => balance: 25),
+            (account: owner0 => seq: 1),
+            (account: owner1 => seq: 1),
+            (account: owner2 => seq: 1),
+            (account: owner3 => seq: 1),
+            (account: owner4 => seq: 1),
+            (shard: 0 => owners: [owner0]),
+            (shard: 1 => owners: [owner1]),
+            (shard: 2 => owners: [owner2]),
+            (shard: shard3 => owners: [owner3]),
+            (shard: shard4 => owners: [owner4]),
+            (metadata: shards: 5),
             (scheme: (shard3, asset_type3) => { supply: 10, metadata: "asset on shard 3".to_string() }),
             (scheme: (shard4, asset_type4) => { supply: 20, metadata: "asset on shard 4".to_string() }),
             (asset: (shard3, mint_tracker3, 0) => { asset_type: asset_type3, quantity: 10, lock_script_hash: lock_script_hash }),
@@ -2874,6 +3024,186 @@ mod tests_tx {
             (asset: (transfer_tracker, 1, shard4)),
             (asset: (mint_tracker3, 0, shard3) => { asset_type: asset_type3, quantity: 10 }),
             (asset: (mint_tracker4, 0, shard4) => { asset_type: asset_type4, quantity: 20 })
+        ]);
+    }
+
+    #[test]
+    fn cannot_create_a_shard_that_user_is_a_regular_account() {
+        let (sender, sender_public, _) = address();
+        let (regular_account, regular_public, _) = address();
+
+        let mut state = get_temp_state();
+        set_top_level_state!(state, [
+            (metadata: shards: 0),
+            (account: sender => balance: 25),
+            (regular_key: sender_public => regular_public)
+        ]);
+
+        let tx = transaction!(fee: 10, Action::CreateShard { users: vec![regular_account] });
+
+        assert_eq!(
+            Ok(Invoice::Failure(
+                RuntimeError::NonActiveAccount {
+                    address: regular_account,
+                    name: "shard user".to_string(),
+                }
+                .to_string()
+            )),
+            state.apply(&tx, &H256::random(), &regular_public, &get_test_client())
+        );
+        check_top_level_state!(state, [
+            (account: sender => (seq: 1, balance: 25 - 10))
+        ]);
+    }
+
+    #[test]
+    fn regular_account_cannot_be_shard_user() {
+        let (sender, sender_public, _) = address();
+        let (regular_account, regular_public, _) = address();
+
+        let shard_id = 0;
+        let mut state = get_temp_state();
+        set_top_level_state!(state, [
+            (account: sender => balance: 25),
+            (shard: shard_id => owners: [sender], users: []),
+            (metadata: shards: 1),
+            (regular_key: sender_public => regular_public)
+        ]);
+
+        let tx = transaction!(fee: 10, Action::SetShardUsers { users: vec![regular_account], shard_id });
+
+        assert_eq!(
+            Ok(Invoice::Failure(
+                RuntimeError::NonActiveAccount {
+                    address: regular_account,
+                    name: "shard user".to_string(),
+                }
+                .to_string()
+            )),
+            state.apply(&tx, &H256::random(), &regular_public, &get_test_client())
+        );
+        check_top_level_state!(state, [
+            (account: sender => (seq: 1, balance: 25 - 10))
+        ]);
+    }
+
+    #[test]
+    fn regular_account_cannot_be_shard_owner() {
+        let (sender, sender_public, _) = address();
+        let (regular_account, regular_public, _) = address();
+
+        let shard_id = 0;
+        let mut state = get_temp_state();
+        set_top_level_state!(state, [
+            (account: sender => balance: 25),
+            (shard: shard_id => owners: [sender], users: []),
+            (metadata: shards: 1),
+            (regular_key: sender_public => regular_public)
+        ]);
+
+        let tx = transaction!(fee: 10, Action::SetShardOwners { owners: vec![regular_account, sender], shard_id });
+
+        assert_eq!(
+            Ok(Invoice::Failure(
+                RuntimeError::NonActiveAccount {
+                    address: regular_account,
+                    name: "shard owner".to_string(),
+                }
+                .to_string()
+            )),
+            state.apply(&tx, &H256::random(), &regular_public, &get_test_client())
+        );
+        check_top_level_state!(state, [
+            (account: sender => (seq: 1, balance: 25 - 10))
+        ]);
+    }
+
+    #[test]
+    fn regular_account_cannot_be_approver() {
+        let (sender, sender_public, _) = address();
+        let (master_account, master_public, _) = address();
+        let (regular_account, regular_public, _) = address();
+
+        let shard_id = 0x0;
+
+        let mut state = get_temp_state();
+        set_top_level_state!(state, [
+            (account: sender => balance: 100),
+            (account: master_account => seq: 1),
+            (shard: shard_id => owners: [sender]),
+            (metadata: shards: 1),
+            (regular_key: master_public => regular_public)
+        ]);
+
+        let transaction = mint_asset!(
+            Box::new(asset_mint_output!(H160::random(), vec![], 30)),
+            "metadata".to_string(),
+            approver: regular_account
+        );
+        let transaction_tracker = transaction.tracker().unwrap();
+        let asset_type = Blake::blake(transaction_tracker);
+        let tx = transaction!(fee: 11, transaction);
+
+        assert_eq!(
+            Ok(Invoice::Failure(
+                RuntimeError::NonActiveAccount {
+                    address: regular_account,
+                    name: "approver of asset".to_string(),
+                }
+                .to_string()
+            )),
+            state.apply(&tx, &H256::random(), &sender_public, &get_test_client())
+        );
+
+        check_top_level_state!(state, [
+            (account: sender => (seq: 1, balance: 100 - 11)),
+            (scheme: (shard_id, asset_type)),
+            (asset: (transaction_tracker, 0, shard_id))
+        ]);
+    }
+
+
+    #[test]
+    fn regular_account_cannot_be_administrator() {
+        let (sender, sender_public, _) = address();
+        let (master_account, master_public, _) = address();
+        let (regular_account, regular_public, _) = address();
+
+        let shard_id = 0x0;
+
+        let mut state = get_temp_state();
+        set_top_level_state!(state, [
+            (account: sender => balance: 100),
+            (account: master_account => seq: 1),
+            (shard: shard_id => owners: [sender]),
+            (metadata: shards: 1),
+            (regular_key: master_public => regular_public)
+        ]);
+
+        let transaction = mint_asset!(
+            Box::new(asset_mint_output!(H160::random(), vec![], 30)),
+            "metadata".to_string(),
+            administrator: regular_account
+        );
+        let transaction_tracker = transaction.tracker().unwrap();
+        let asset_type = Blake::blake(transaction_tracker);
+        let tx = transaction!(fee: 11, transaction);
+
+        assert_eq!(
+            Ok(Invoice::Failure(
+                RuntimeError::NonActiveAccount {
+                    address: regular_account,
+                    name: "administrator of asset".to_string(),
+                }
+                .to_string()
+            )),
+            state.apply(&tx, &H256::random(), &sender_public, &get_test_client())
+        );
+
+        check_top_level_state!(state, [
+            (account: sender => (seq: 1, balance: 100 - 11)),
+            (scheme: (shard_id, asset_type)),
+            (asset: (transaction_tracker, 0, shard_id))
         ]);
     }
 }
