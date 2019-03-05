@@ -198,12 +198,12 @@ impl TendermintInner {
             .hash()
     }
 
-    /// Get the proposer of previous block to check new proposer is valid.
-    fn prev_block_proposer_idx(&self, height: Height) -> Option<usize> {
-        self.prev_block_header_of_height(height).map(|prev_header| {
-            let prev_proposer = prev_header.author();
+    /// Get the index of the proposer of a block to check the new proposer is valid.
+    fn block_proposer_idx(&self, block_hash: H256) -> Option<usize> {
+        self.client().block_header(&BlockId::Hash(block_hash)).map(|header| {
+            let proposer = header.author();
             self.validators
-                .get_index_by_address(&self.prev_block_hash(), &prev_proposer)
+                .get_index_by_address(&self.prev_block_hash(), &proposer)
                 .expect("The proposer must be in the validator set")
         })
     }
@@ -226,11 +226,11 @@ impl TendermintInner {
     }
 
     /// Find the designated for the given view.
-    fn view_proposer(&self, bh: &H256, height: Height, view: View) -> Option<Address> {
-        self.prev_block_proposer_idx(height).map(|prev_proposer_idx| {
+    fn view_proposer(&self, prev_block_hash: &H256, _height: Height, view: View) -> Option<Address> {
+        self.block_proposer_idx(*prev_block_hash).map(|prev_proposer_idx| {
             let proposer_nonce = prev_proposer_idx + 1 + view;
             ctrace!(ENGINE, "Proposer nonce: {}", proposer_nonce);
-            self.validators.get_address(bh, proposer_nonce)
+            self.validators.get_address(prev_block_hash, proposer_nonce)
         })
     }
 
@@ -769,8 +769,7 @@ impl TendermintInner {
         } else {
             panic!("Block is generated at unexpected step {:?}", self.step);
         }
-        let prev_proposer_idx =
-            self.prev_block_proposer_idx(header.number() as Height).expect("Prev block must exists");
+        let prev_proposer_idx = self.block_proposer_idx(*header.parent_hash()).expect("Prev block must exists");
 
         let vote_step =
             VoteStep::new(header.number() as Height, consensus_view(&header).expect("I am proposer"), Step::Propose);
@@ -1695,7 +1694,7 @@ impl TendermintExtension {
             }
 
             let num_validators = tendermint.validators.count(&parent_hash);
-            let prev_proposer_idx = match tendermint.prev_block_proposer_idx(number as Height) {
+            let prev_proposer_idx = match tendermint.block_proposer_idx(*parent_hash) {
                 Some(idx) => idx,
                 None => {
                     cwarn!(ENGINE, "Prev block proposer does not exist for height {}", number);
