@@ -62,6 +62,7 @@ const FIRST_OUTGOING: StreamToken = FIRST_INCOMING + 1000;
 const LAST_OUTGOING: StreamToken = FIRST_OUTGOING + MAX_OUTGOING_CONNECTIONS - 1;
 
 const CREATE_CONNECTIONS: TimerToken = 0;
+const CONNECT_TO_BOOTSTRAP: TimerToken = CREATE_CONNECTIONS + 1;
 
 const FIRST_WAIT_SYNC: TimerToken = FIRST_INCOMING;
 const LAST_WAIT_SYNC: TimerToken = LAST_INCOMING;
@@ -107,6 +108,8 @@ pub struct Handler {
 
     client: Arc<Client>,
 
+    bootstrap_addresses: Vec<SocketAddr>,
+
     min_peers: usize,
     max_peers: usize,
 
@@ -121,6 +124,7 @@ impl Handler {
         client: Arc<Client>,
         routing_table: Arc<RoutingTable>,
         filters: Arc<FiltersControl>,
+        bootstrap_addresses: Vec<SocketAddr>,
         min_peers: usize,
         max_peers: usize,
     ) -> ::std::result::Result<Self, String> {
@@ -156,6 +160,7 @@ impl Handler {
 
             client,
 
+            bootstrap_addresses,
             min_peers,
             max_peers,
 
@@ -198,13 +203,21 @@ impl Handler {
             return Ok(())
         };
 
+        if self.routing_table.is_establishing_or_established(&socket_address) {
+            return Ok(())
+        }
+
         if let Some(stream) = Stream::connect(&socket_address)? {
             let mut outgoing_connections = self.outgoing_connections.write();
             // Please make sure there is no early return after it.
             let initiator_port = self.socket_address.port();
             let con =
                 OutgoingConnection::new(stream, initiator_pub_key, self.network_id, initiator_port, socket_address)?;
-            let token = self.outgoing_tokens.lock().gen().ok_or("Too many outgoing connections")?;
+            let token = self
+                .outgoing_tokens
+                .lock()
+                .gen()
+                .ok_or_else(|| format!("Too many outgoing connections: {}", outgoing_connections.len()))?;
             let t = outgoing_connections.insert(token, con);
             assert!(t.is_none());
             io.register_stream(token);
@@ -256,6 +269,7 @@ impl IoHandler<Message> for Handler {
     fn initialize(&self, io: &IoContext<Message>) -> IoHandlerResult<()> {
         io.register_stream(ACCEPT);
         io.register_timer_once(CREATE_CONNECTIONS, CREATE_CONNECTION_INTERVAL);
+        io.register_timer_once(CONNECT_TO_BOOTSTRAP, Duration::default());
         Ok(())
     }
 
@@ -289,6 +303,47 @@ impl IoHandler<Message> for Handler {
 
                 io.register_timer_once(CREATE_CONNECTIONS, CREATE_CONNECTION_INTERVAL);
             }
+            CONNECT_TO_BOOTSTRAP => {
+                // DO not try to connect to bootstrap nodes if there is a connection
+                {
+                    let inbound_connections = self.inbound_connections.read();
+                    let outbound_connections = self.outbound_connections.read();
+                    let incoming_connections = self.incoming_connections.read();
+                    let outgoing_connections = self.outgoing_connections.read();
+                    if !inbound_connections.is_empty() {
+                        return Ok(())
+                    }
+                    if !outbound_connections.is_empty() {
+                        return Ok(())
+                    }
+                    if !incoming_connections.is_empty() {
+                        return Ok(())
+                    }
+                    if !outgoing_connections.is_empty() {
+                        return Ok(())
+                    }
+                }
+
+                let mut boots: Vec<_> = self
+                    .bootstrap_addresses
+                    .iter()
+                    .filter(|addr| !self.routing_table.is_establishing_or_established(addr))
+                    .filter(|addr| !self.routing_table.is_banned(addr))
+                    .filter(|addr| self.filters.is_allowed(&addr.ip()))
+                    .collect();
+                boots.shuffle(&mut *self.rng.lock());
+                // It tries to connect to 3 of bootstrap nodes.
+                // FIXME: 3 is a magic number.
+                for addr in boots.into_iter().take(3) {
+                    if let Err(err) = self.connect(io, *addr) {
+                        self.routing_table.remove(addr);
+                        cwarn!(NETWORK, "Cannot connect to bootstrap address {}: {:?}", addr, err);
+                    }
+                }
+
+                const CHECK_BOOTSTRAP_INTERVAL: Duration = Duration::from_secs(15);
+                io.register_timer_once(CONNECT_TO_BOOTSTRAP, CHECK_BOOTSTRAP_INTERVAL);
+            }
             FIRST_WAIT_SYNC...LAST_WAIT_SYNC => {
                 cwarn!(NETWORK, "No sync message from {}", timer);
                 io.deregister_stream(wait_sync_stream(timer));
@@ -302,7 +357,13 @@ impl IoHandler<Message> for Handler {
                 let mut outgoing_connections = self.outgoing_connections.write();
                 if let Some(con) = outgoing_connections.get_mut(&stream) {
                     let target = *con.peer_addr();
-                    let maybe_remote_public = self.routing_table.try_establish(target)?;
+                    let maybe_remote_public = match self.routing_table.try_establish(target) {
+                        Ok(maybe_remote_public) => maybe_remote_public,
+                        Err(err) => {
+                            io.deregister_stream(stream);
+                            return Err(err.into())
+                        }
+                    };
                     con.send_sync(maybe_remote_public);
                     io.register_timer_once(wait_ack_timer(stream), RTT);
                     io.update_registration(stream);
@@ -396,8 +457,20 @@ impl IoHandler<Message> for Handler {
                 let mut inbound_connections = self.inbound_connections.write();
                 if let Some(token) = self.inbound_tokens.lock().gen() {
                     let remote_node_id = connection.peer_addr().into();
-                    assert_eq!(None, self.remote_node_ids.write().insert(token, remote_node_id));
-                    assert_eq!(None, self.remote_node_ids_reverse.write().insert(remote_node_id, token));
+                    assert_eq!(
+                        None,
+                        self.remote_node_ids.write().insert(token, remote_node_id),
+                        "{}:{} is already registered",
+                        remote_node_id,
+                        token
+                    );
+                    assert_eq!(
+                        None,
+                        self.remote_node_ids_reverse.write().insert(remote_node_id, token),
+                        "{}:{} is already registered",
+                        remote_node_id,
+                        token
+                    );
 
                     let t = inbound_connections.insert(token, connection);
                     assert!(t.is_none());
@@ -414,8 +487,20 @@ impl IoHandler<Message> for Handler {
                 if let Some(token) = self.outbound_tokens.lock().gen() {
                     let peer_addr = *connection.peer_addr();
                     let remote_node_id = peer_addr.into();
-                    assert_eq!(None, self.remote_node_ids.write().insert(token, remote_node_id));
-                    assert_eq!(None, self.remote_node_ids_reverse.write().insert(remote_node_id, token));
+                    assert_eq!(
+                        None,
+                        self.remote_node_ids.write().insert(token, remote_node_id),
+                        "{}:{} is already registered",
+                        remote_node_id,
+                        token
+                    );
+                    assert_eq!(
+                        None,
+                        self.remote_node_ids_reverse.write().insert(remote_node_id, token),
+                        "{}:{} is already registered",
+                        remote_node_id,
+                        token
+                    );
 
                     for (name, versions) in self.client.extension_versions() {
                         connection.enqueue_negotiation_request(name.clone(), versions);
@@ -434,8 +519,11 @@ impl IoHandler<Message> for Handler {
                 io.register_timer_once(timer, timeout);
             }
             Message::StartConnect => {
-                io.clear_timer(CREATE_CONNECTIONS);
                 io.register_timer_once(CREATE_CONNECTIONS, CREATE_CONNECTION_INTERVAL);
+            }
+            Message::ConnectToBootstrap => {
+                const CHECK_BOOTSTRAP_INTERVAL: Duration = Duration::from_secs(5);
+                io.register_timer_once(CONNECT_TO_BOOTSTRAP, CHECK_BOOTSTRAP_INTERVAL);
             }
         }
         Ok(())
@@ -464,6 +552,7 @@ impl IoHandler<Message> for Handler {
         Ok(())
     }
 
+    #[allow(clippy::cyclomatic_complexity)]
     fn stream_readable(&self, io: &IoContext<Message>, stream_token: StreamToken) -> IoHandlerResult<()> {
         match stream_token {
             ACCEPT => {
@@ -499,7 +588,11 @@ impl IoHandler<Message> for Handler {
                         cwarn!(NETWORK, "P2P connection request from {} is received. But it's not allowed", ip);
                         return Ok(())
                     }
-                    let token = self.incoming_tokens.lock().gen().ok_or("Too many incomming connections")?;
+                    let token = self
+                        .incoming_tokens
+                        .lock()
+                        .gen()
+                        .ok_or_else(|| format!("Too many incoming connections: {}", incoming_connections.len()))?;
                     // Please make sure there is no early return after it.
                     let t = incoming_connections.insert(token, IncomingConnection::new(stream));
                     assert!(t.is_none());
@@ -652,7 +745,7 @@ impl IoHandler<Message> for Handler {
                             } else {
                                 cinfo!(NETWORK, "Send nack to {}", from);
                                 con.send_nack();
-                                io.clear_timer(wait_sync_timer(stream_token));
+                                io.register_timer_once(wait_sync_timer(stream_token), WAIT_SYNC);
                             }
                         }
                         Some(OutgoingMessage::Sync2 {
@@ -671,6 +764,7 @@ impl IoHandler<Message> for Handler {
                                 .routing_table
                                 .set_recipient_establish2(from, recipient_pub_key, initiator_pub_key)?
                             {
+                                cinfo!(NETWORK, "Send ack to {}", from);
                                 con.send_ack(local_public, encrypted_nonce);
                                 let t = self
                                     .establishing_incoming_session
@@ -681,8 +775,9 @@ impl IoHandler<Message> for Handler {
                                 should_update.store(false, Ordering::SeqCst);
                                 io.deregister_stream(stream_token);
                             } else {
-                                io.clear_timer(wait_sync_timer(stream_token));
+                                cinfo!(NETWORK, "Send nack to {}", from);
                                 con.send_nack();
+                                io.register_timer_once(wait_sync_timer(stream_token), WAIT_SYNC);
                             }
                         }
                         None => {
@@ -723,11 +818,9 @@ impl IoHandler<Message> for Handler {
                         Some(IncomingMessage::Nack) => {
                             cinfo!(NETWORK, "Nack from {}", from);
                             self.routing_table.reset_initiator_establish(from)?;
-                            let timeout = self.rng.lock().gen_range(Duration::from_millis(1), RETRY_SYNC_MAX);
                             io.clear_timer(wait_ack_timer(stream_token));
-                            let timer_token = retry_sync_timer(stream_token);
-                            io.clear_timer(timer_token);
-                            io.register_timer_once(timer_token, timeout);
+                            let timeout = self.rng.lock().gen_range(Duration::from_millis(1), RETRY_SYNC_MAX);
+                            io.register_timer_once(retry_sync_timer(stream_token), timeout);
                         }
                         None => {
                             should_update.store(false, Ordering::SeqCst);
@@ -979,6 +1072,8 @@ impl IoHandler<Message> for Handler {
             }
             _ => unreachable!("Unexpected stream on deregister: {}", stream),
         }
+
+        self.channel.send(Message::ConnectToBootstrap)?;
         Ok(())
     }
 }
@@ -1008,6 +1103,7 @@ pub enum Message {
         timeout: Duration,
     },
     StartConnect,
+    ConnectToBootstrap,
 }
 
 #[derive(Debug)]

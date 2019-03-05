@@ -18,6 +18,7 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
+use cidr::IpCidr;
 use cio::{IoError, IoService};
 use ckey::{NetworkId, Public};
 use ctimer::TimerLoop;
@@ -43,6 +44,7 @@ impl Service {
         network_id: NetworkId,
         timer_loop: TimerLoop,
         address: SocketAddr,
+        bootstrap_addresses: Vec<SocketAddr>,
         min_peers: usize,
         max_peers: usize,
         filters_control: Arc<FiltersControl>,
@@ -60,6 +62,7 @@ impl Service {
             Arc::clone(&client),
             Arc::clone(&routing_table),
             Arc::clone(&filters_control),
+            bootstrap_addresses,
             min_peers,
             max_peers,
         )?);
@@ -140,12 +143,12 @@ impl Control for Service {
         Ok(self.p2p_handler.established_peers())
     }
 
-    fn add_to_whitelist(&self, addr: IpAddr, tag: Option<String>) -> Result<(), ControlError> {
+    fn add_to_whitelist(&self, addr: IpCidr, tag: Option<String>) -> Result<(), ControlError> {
         self.filters_control.add_to_whitelist(addr, tag);
         Ok(())
     }
 
-    fn remove_from_whitelist(&self, addr: &IpAddr) -> Result<(), ControlError> {
+    fn remove_from_whitelist(&self, addr: &IpCidr) -> Result<(), ControlError> {
         self.filters_control.remove_from_whitelist(addr);
         if let Err(err) = self.p2p.send_message(p2p::Message::ApplyFilters) {
             cerror!(NETWORK, "Error occurred while apply filters: {:?}", err);
@@ -153,7 +156,7 @@ impl Control for Service {
         Ok(())
     }
 
-    fn add_to_blacklist(&self, addr: IpAddr, tag: Option<String>) -> Result<(), ControlError> {
+    fn add_to_blacklist(&self, addr: IpCidr, tag: Option<String>) -> Result<(), ControlError> {
         self.filters_control.add_to_blacklist(addr, tag);
         if let Err(err) = self.p2p.send_message(p2p::Message::ApplyFilters) {
             cerror!(NETWORK, "Error occurred while apply filters: {:?}", err);
@@ -161,7 +164,7 @@ impl Control for Service {
         Ok(())
     }
 
-    fn remove_from_blacklist(&self, addr: &IpAddr) -> Result<(), ControlError> {
+    fn remove_from_blacklist(&self, addr: &IpCidr) -> Result<(), ControlError> {
         self.filters_control.remove_from_blacklist(addr);
         Ok(())
     }

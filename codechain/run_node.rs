@@ -56,8 +56,16 @@ fn network_start(
     let addr = cfg.address.parse().map_err(|_| format!("Invalid NETWORK listen host given: {}", cfg.address))?;
     let sockaddress = SocketAddr::new(addr, cfg.port);
     let filters = Filters::new(cfg.whitelist.clone(), cfg.blacklist.clone());
-    let service = NetworkService::start(network_id, timer_loop, sockaddress, cfg.min_peers, cfg.max_peers, filters)
-        .map_err(|e| format!("Network service error: {:?}", e))?;
+    let service = NetworkService::start(
+        network_id,
+        timer_loop,
+        sockaddress,
+        cfg.bootstrap_addresses.clone(),
+        cfg.min_peers,
+        cfg.max_peers,
+        filters,
+    )
+    .map_err(|e| format!("Network service error: {:?}", e))?;
 
     Ok(service)
 }
@@ -67,22 +75,15 @@ fn discovery_start(service: &NetworkService, cfg: &config::Network) -> Result<()
         bucket_size: cfg.discovery_bucket_size.unwrap(),
         t_refresh: cfg.discovery_refresh.unwrap(),
     };
-    match cfg.discovery_type.as_ref().map(|s| s.as_str()) {
-        Some("unstructured") => {
-            cinfo!(DISCOVERY, "Node runs with unstructured discovery");
-            let discovery = service.new_extension(|api| Discovery::unstructured(config, api));
-            service.set_routing_table(&*discovery);
-            Ok(())
-        }
-        Some("kademlia") => {
-            cinfo!(DISCOVERY, "Node runs with kademlia discovery");
-            let discovery = service.new_extension(|api| Discovery::kademlia(config, api));
-            service.set_routing_table(&*discovery);
-            Ok(())
-        }
-        Some(discovery_type) => Err(format!("Unknown discovery {}", discovery_type)),
-        None => Ok(()),
-    }
+    let use_kademlia = match cfg.discovery_type.as_ref().map(|s| s.as_str()) {
+        Some("unstructured") => false,
+        Some("kademlia") => true,
+        Some(discovery_type) => return Err(format!("Unknown discovery {}", discovery_type)),
+        None => return Ok(()),
+    };
+    let discovery = service.new_extension(|api| Discovery::new(config, api, use_kademlia));
+    service.set_routing_table(&*discovery);
+    Ok(())
 }
 
 fn client_start(
@@ -259,6 +260,8 @@ pub fn run_node(matches: &ArgMatches) -> Result<(), String> {
 
     let miner = new_miner(&config, &scheme, ap.clone(), Arc::clone(&db))?;
     let client = client_start(&client_config, &timer_loop, db, &scheme, miner.clone())?;
+    miner.recover_from_db(client.client().as_ref());
+
     let mut some_sync = None;
 
     scheme.engine.register_chain_notify(client.client().as_ref());
@@ -286,9 +289,6 @@ pub fn run_node(matches: &ArgMatches) -> Result<(), String> {
 
             scheme.engine.register_network_extension_to_service(&service);
 
-            for address in network_config.bootstrap_addresses {
-                service.connect_to(address)?;
-            }
             service
         } else {
             Arc::new(DummyNetworkService::new())
